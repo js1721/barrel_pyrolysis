@@ -1,0 +1,127 @@
+cmake_minimum_required(VERSION 3.6) 
+
+# set(CMAKE_Fortran_COMPILER ifx)
+
+# Set our project name and Fortran as only language we compile 
+# (C and C++ are also available) and should be added if we interop 
+project(neutron_code VERSION 0.1 
+    DESCRIPTION "BANTAM CODE FOR SOLVING THE Pal-Bell equation"
+    LANGUAGES Fortran C
+    )
+
+# we default to Release build type
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Debug")
+endif()
+
+# if(CMAKE_Fortran_COMPILER_ID MATCHES Intel)
+#     set(CMAKE_Fortran_FLAGS         "${CMAKE_Fortran_FLAGS} -Wall")
+#     set(CMAKE_Fortran_FLAGS_DEBUG   "-g -traceback")
+#     set(CMAKE_Fortran_FLAGS_RELEASE "-O3 -ip -xHOST")
+# endif()
+
+# petsc SHIT
+
+# if(APPLE)
+#     set(PETSC_DIR "/usr/local/Cellar/petsc/3.23.3")
+#     set(PETSC_INCLUDES "${PETSC_DIR}/include")
+#     # set(PETSC_LIBRARIES "${PETSC_DIR}/lib/libpetsc.so")
+#     set(PETSC_LIBRARIES "${PETSC_DIR}/lib/libpetsc.3.23.3.dylib")
+# else()
+#     set(PETSC_DIR "/home/joe/PETSC_CRINGE/petsc-openmp")
+#     set(PETSC_INCLUDES "${PETSC_DIR}/include")
+#     # set(PETSC_LIBRARIES "${PETSC_DIR}/lib/libpetsc.so")
+#     set(PETSC_LIBRARIES "${PETSC_DIR}/lib/libpetsc.so")
+# endif()
+
+if(APPLE)
+    if(CMAKE_Fortran_COMPILER_ID MATCHES GNU)
+        set(CMAKE_Fortran_FLAGS         "${CMAKE_Fortran_FLAGS} -ffree-line-length-none ")
+        #set(CMAKE_Fortran_FLAGS_DEBUG   "-O0 -fcheck=all -fdec -DDEBUG -fopenmp -finit-real=snan -finit-integer=-9999 -ffpe-trap=invalid,zero,overflow -pedantic -I${PETSC_DIR}/include")
+        set(CMAKE_Fortran_FLAGS_DEBUG   "-O0 -fcheck=all -fdec -DDEBUG -fopenmp -finit-real=snan -finit-integer=-9999 -ffpe-trap=invalid,zero,overflow -pedantic ")
+        # set(CMAKE_Fortran_FLAGS_RELEASE "-Ofast -DNDEBUG -fopenmp ")
+        #set(CMAKE_Fortran_FLAGS_RELEASE "-O2 -march=native -DNDEBUG -fopenmp -I${PETSC_DIR}/include")
+        set(CMAKE_Fortran_FLAGS_RELEASE "-O2 -march=native -DNDEBUG -fopenmp ")
+    endif()
+else()
+    if(CMAKE_Fortran_COMPILER_ID MATCHES GNU)
+        set(CMAKE_Fortran_FLAGS         "${CMAKE_Fortran_FLAGS} -Wall -ffree-line-length-none ")
+        #set(CMAKE_Fortran_FLAGS_DEBUG   "-O0 -fcheck=all -fdec -DDEBUG -pg -fopenmp -finit-real=snan -finit-integer=-9999 -ffpe-trap=invalid,zero,overflow -I${PETSC_DIR}/include")
+        set(CMAKE_Fortran_FLAGS_DEBUG   "-O0 -fcheck=all -fdec -DDEBUG -pg -fopenmp -finit-real=snan -finit-integer=-9999 -ffpe-trap=invalid,zero,overflow ")
+        # set(CMAKE_Fortran_FLAGS_RELEASE "-Ofast -DNDEBUG -fopenmp ")
+        #set(CMAKE_Fortran_FLAGS_RELEASE "-O2 -march=native -DNDEBUG -fopenmp -pg -I${PETSC_DIR}/include")
+        set(CMAKE_Fortran_FLAGS_RELEASE "-O2 -march=native -DNDEBUG -fopenmp -pg ")
+    endif()
+endif()
+
+
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/..)
+
+# set(CMAKE_OSX_ARCHITECTURES x86_64)
+
+# set(CMAKE_VERBOSE_MAKEFILE ON)
+
+# set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -lgcrt1.o")
+
+# EXTERNAL PACKAGES
+# Fortran Standard Library:
+
+# find_package(LAPACK REQUIRED)
+# find_package(BLAS REQUIRED)
+
+#PETSC SHIT
+# message(STATUS "Found PETSc: ${PETSC_DIR}")
+# message(STATUS "PETSc Includes: ${PETSC_INCLUDES}")
+# message(STATUS "PETSc Libraries: ${PETSC_LIBRARIES}")
+
+#find_package(fortran_stdlib REQUIRED)
+
+# To use this please have stdlib built with CMake already 
+
+#NB this should be the actual build e.g. the ARCH folder I think
+# (I am using a ./configure --prefix <....> build)
+#set(MY_PETSC_PATH "/usr/lib/cmake/PETSc") 
+#set(CMAKE_PREFIX_PATH ${CMAKE_PREFIX_PATH} ${MY_PETSC_PATH}) 
+
+# the `pkg_check_modules` function is created with this call
+#find_package(PkgConfig REQUIRED)
+#pkg_check_modules(PETSC REQUIRED PETSc)
+
+# Add include directories
+#INCLUDE_DIRECTORIES(${PETSC_INCLUDE_DIRS})
+
+# Add our source files
+# All .f90 files in lib/ will be added to the library as sources
+# Below command finds all .f90 and adds them to the ${SOURCES} variable
+
+# file(GLOB SOURCES "stdlib/*.f90" "stdlib/*.F90" main.f90)
+# add_executable(output ${SOURCES})
+
+add_library(src
+        src/precision.f90
+		src/mesh_module.f90
+		src/tridiag_module.f90
+		src/power_iteration_module.f90
+		src/bc_module.f90
+		src/TA_module.f90
+		src/solver_module.f90
+		src/multigroup_module.f90
+	   	src/write_to_csv_module.f90
+		src/sparse_matrix_module.f90
+		src/conjugate_gradient_module.f90
+)
+
+# add_subdirectory(stdlib)
+add_executable(out src/main.f90)
+
+#NON PETSC 
+# target_link_libraries(Bantam.exe src)
+# target_link_libraries(Bantam.exe LAPACK::LAPACK BLAS::BLAS)
+
+#PETSC
+#target_include_directories(Bantam.exe PRIVATE ${PETSC_INCLUDES})
+# target_link_libraries(Bantam.exe PRIVATE src ${PETSC_LIBRARIES} LAPACK::LAPACK BLAS::BLAS)
+target_link_libraries(out PRIVATE src )
+# target_link_libraries(output PRIVATE src ${PETSC_LIBRARIES} LAPACK::LAPACK BLAS::BLAS ${MPI_Fortran_LIBRARIES})
+
+#TARGET_LINK_LIBRARIES(Output ${PETSC_LINK_LIBRARIES} fortran_stdlib::fortran_stdlib)

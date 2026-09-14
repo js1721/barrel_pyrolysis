@@ -1,0 +1,46 @@
+# ── Overleaf-managed LaTeX ───────────────────────────────────────────
+# paper/ is already its own git repo (cloned from Overleaf), so it is
+# deliberately NOT tracked here -- Overleaf stays the single source of
+# truth for the .tex. Push/pull it separately from inside paper/.
+# Delete this line only if you intend to abandon the Overleaf clone and
+# vendor the paper into this repo instead.
+paper/
+
+# ── Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Generated plots -- reproducible by rerunning verification_tests.py /
+# publication_plots.py, so not worth versioning binary PNGs that change
+# on every run. Remove this line if you'd rather pin the exact figures
+# that went into a given draft.
+figures/
+
+# ── Fortran / CMake build artefacts (Training_code/) ─────────────────
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile.cmake
+*.o
+*.mod
+*.smod
+*.a
+*.so
+a.out
+gmon.out
+*.bin
+
+# The bare `out` binaries produced by the 1D/2D diffusion makefiles.
+# Anchored per-directory rather than a bare `out` so a future source
+# file or folder legitimately named "out.f90"/"out/" elsewhere isn't
+# silently swallowed.
+Training_code/1D_Diffusion/out
+Training_code/2D_Diffusion/out
+
+# ── macOS ────────────────────────────────────────────────────────────
+.DS_Store
