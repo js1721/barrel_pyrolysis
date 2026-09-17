@@ -8,9 +8,15 @@ device) pick up without re-deriving the context.
 
 Coupled stochastic-mixture heat conduction + two-group neutron
 diffusion / point kinetics for a PuO2 + combustible-waste storage
-drum. Python solver in `barrel_pyrolysis1d/`; the paper is a separate
-Overleaf-backed git repo under `paper/` (gitignored here — Overleaf is
-the single source of truth for the `.tex`).
+drum. Python solver in `barrel_pyrolysis1d/`; the paper lives in
+`paper/`.
+
+**On `paper/`:** it is simultaneously a clone of an Overleaf repo *and*
+vendored into this repo, so the `.tex` is readable and editable without
+Overleaf credentials. That means two copies exist between syncs. Treat
+this repo as the working copy; Overleaf gets updated by pushing from
+inside `paper/` (which has its own `origin`) from the machine that holds
+those credentials. Don't edit both in the same stretch of work.
 
 ## What changed this session
 

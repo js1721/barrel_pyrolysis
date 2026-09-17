@@ -1,10 +1,24 @@
-# ── Overleaf-managed LaTeX ───────────────────────────────────────────
-# paper/ is already its own git repo (cloned from Overleaf), so it is
-# deliberately NOT tracked here -- Overleaf stays the single source of
-# truth for the .tex. Push/pull it separately from inside paper/.
-# Delete this line only if you intend to abandon the Overleaf clone and
-# vendor the paper into this repo instead.
-paper/
+# ── LaTeX source (vendored) ──────────────────────────────────────────
+# paper/ is ALSO its own git repo, cloned from Overleaf
+# (git.overleaf.com/69c12469b917d4e261cb82c3). The .tex and the figures
+# it references are tracked here too, so that sessions without access
+# to this machine -- or to the Overleaf credentials -- can still read
+# and edit the paper.
+#
+# Consequence to keep in mind: between syncs there are two copies. This
+# repo is the working copy; Overleaf is updated by pushing from INSIDE
+# paper/ (it has its own origin) when you're next at the Mac. Avoid
+# editing both in the same stretch of work, or you'll be reconciling by
+# hand.
+#
+# Note `paper/*` rather than `paper/` -- git cannot re-include a file
+# whose parent DIRECTORY is excluded, so the directory itself has to
+# stay visible and its contents excluded piecewise for the negations
+# below to take effect.
+paper/*
+!paper/*.tex
+!paper/*.png
+!paper/*.bib
 
 # ── Python ───────────────────────────────────────────────────────────
 __pycache__/
