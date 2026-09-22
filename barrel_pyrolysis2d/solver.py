@@ -1,281 +1,185 @@
-import numpy as np
+"""
+solver.py  (2D axisymmetric r-z)
+================================
+Coupled thermal / neutronic / kinetic transient for a cylindrical drum,
+the 2D counterpart of barrel_pyrolysis1d/solver.py on the same basis:
+relaxational stochastic closure, one eigenvalue for the coupled phases,
+Marshak vacuum boundaries, neutron-temperature thermal group, absolute
+flux amplitude and a source-driven initial state.
+
+Per step (operator split, each piece explicit in the others):
+  A. point kinetics with the intrinsic source   (kinetics.py)
+  B. moderator percolation, if enabled          (percolation.py)
+  D. pyrolysis, exact over the step, energy-consistent heat release
+  C. two-phase conduction                       (thermal.py)
+  E. new shape, k_eff and Lambda                (neutronics.py)
+
+Geometry and boundaries: axis r = 0 symmetric; heated floor z = 0 at
+T_f (convective + radiative); top z = H losing to T_amb; the drum wall
+r = R held at T_amb (thermal) and a vacuum boundary (neutronic).
+"""
+
 from dataclasses import dataclass, field
 from typing import List
 
-from materials import (make_PuO, make_combustible,
-                        BETA, DELAYED_GROUPS)
-from mesh import CylindricalMesh2D
-from thermal import (solve_thermal_step,
-                      advance_pyrolysis,
-                      initialise_omega)
-from neutronics import static_shape_solve, compute_Lambda
-from kinetics import advance_kinetics, initialise_precursors
+import numpy as np
 
-Rg = 8.314
+from mesh import CylindricalMesh2D
+from materials import make_PuO, make_combustible
+from thermal import solve_thermal_step, initialise_omega
+from neutronics import (static_shape_solve, compute_Lambda,
+                        source_amplitude_rate)
+from kinetics import (advance_kinetics, initialise_precursors,
+                      source_driven_steady_state)
+from sources import source_density as pu_source_density
+from percolation import (PercolationConfig, initialise_theta,
+                         advance_percolation, adaptive_dt, thermal_sink,
+                         mu_field)
 
 
 @dataclass
 class Config:
-    """
-    Solver configuration.
-    All boundary conditions from Section 4.1 of document.
-    """
-    # --- Geometry ---
-    R:    float = 20.0
-    H:    float = 40.0
-    Nr:   int   = 30
-    Nz:   int   = 60
-
-    # --- Stochastics (mu_r = mu_z = mu, document note) ---
-    mu:   float = 0.5
-    v1:   float = 0.4
-
-    # --- Time ---
-    t_end: float = 200.0
-    dt:    float = 0.1
-
-    # --- Initial conditions (Eqs. 78-80) ---
-    T0:   float = 300.0   # Eq. (78)
-    P0:   float = 1.0     # Eq. (79)
-
-    # --- Heating BC at z=0 (Eq. 66) ---
-    T_f:        float = 1200.0   # furnace temperature K
-    h_conv:     float = 50.0     # convective HTC W/m^2/K
-    emissivity: float = 0.9      # surface emissivity
-
-    # --- Physics ---
-    neutron_speed: float = 2.2e5
-    Ef:            float = 3.2e-11
+    # geometry (cm)
+    R: float = 20.0
+    H: float = 40.0
+    Nr: int = 20
+    Nz: int = 40
+    # mixture: inverse correlation length (cm^-1; mu_r = mu_z = mu for
+    # isotropic chunks) and fuel volume fraction
+    mu: float = 0.5
+    v1: float = 0.3
+    percolation: PercolationConfig = field(default_factory=PercolationConfig)
+    # time (s)
+    t_end: float = 300.0
+    dt: float = 0.5
+    # initial / boundary
+    T0: float = 300.0
+    T_f: float = 1200.0
+    h_conv: float = 50.0
+    emissivity: float = 0.3
+    T_amb: float = 300.0
+    Ef: float = 3.2e-11
+    radial_bc: str = "vacuum"
+    # power scale: P0 = None -> source-driven steady state (needs k0 < 1);
+    # phi = P psi in n/cm^2/s, psi's fuel phase unit volume integral
+    P0: float = None
+    isotopics: object = "reactor"
+    source_density: float = None
 
 
 @dataclass
 class State:
-    """Complete system state."""
-    t:      float
-    T:      np.ndarray    # (2, Nr, Nz)
-    omega:  np.ndarray    # (2, Nr, Nz)
-    phi:    np.ndarray    # (2, Nr, Nz)
-    psi:    np.ndarray    # (2, Nr, Nz)
-    P:      float
-    C:      np.ndarray    # (I_GRP,)
-    k_eff:  float
-    rho:    float
+    t: float
+    T: np.ndarray        # (2, Nr, Nz)
+    omega: np.ndarray    # (2, Nr, Nz)
+    theta: np.ndarray    # (Nr, Nz)
+    psi: np.ndarray      # (2 phases, 2 groups, Nr, Nz)
+    P: float
+    C: np.ndarray
+    k_eff: float
+    rho: float
     Lambda: float
-    v:      np.ndarray    # (2,)
 
 
 class Solver:
-    """
-    2D cylindrical two-phase stochastic pyrolysis
-    and neutronics solver.
-
-    Boundary conditions from Section 4.1 of document:
-      Thermal z=0  : convective + radiative (Eqs. 76-77)
-      Thermal other: stochastic Neumann (Eqs. 72-73)
-      Neutronics   : stochastic vacuum (Eqs. 83-84)
-      Neutronics r=0: symmetry
-
-    Operator split:
-      A. Point kinetics
-      B. Thermal solve  (with BCs 76-77 at z=0)
-      C. Pyrolysis
-      D. Static shape   (with BCs 83-84)
-    """
-
-    def __init__(self, config: Config):
-        self.cfg  = config
-        self.mesh = CylindricalMesh2D(
-            config.R, config.H, config.Nr, config.Nz
-        )
-        self.mats    = [make_PuO(), make_combustible()]
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.mesh = CylindricalMesh2D(R=cfg.R, H=cfg.H, Nr=cfg.Nr, Nz=cfg.Nz)
+        self.phases = [make_PuO(), make_combustible()]
+        self.v = np.array([cfg.v1, 1.0 - cfg.v1])
+        self.q_density = (float(cfg.source_density) if cfg.source_density is not None
+                          else pu_source_density(cfg.isotopics, self.phases[0].rho * 1e-3))
         self.history: List[dict] = []
 
+    def _mu(self, theta):
+        if self.cfg.percolation.enabled:
+            return mu_field(theta, self.cfg.percolation)
+        return np.full((self.cfg.Nr, self.cfg.Nz), self.cfg.mu)
+
+    def _shape(self, T, theta, psi_init=None):
+        mu = self._mu(theta)
+        k, psi = static_shape_solve(self.phases, self.mesh, T, self.v, mu, mu,
+                                    psi_init=psi_init, radial_bc=self.cfg.radial_bc)
+        return k, psi, compute_Lambda(self.phases, self.mesh, psi, T, self.v)
+
     def initialise(self) -> State:
-        cfg    = self.cfg
-        mesh   = self.mesh
-        mats   = self.mats
-        Nr, Nz = mesh.Nr, mesh.Nz
+        c, m = self.cfg, self.mesh
+        T = np.full((2, m.Nr, m.Nz), c.T0)
+        omega = initialise_omega(self.phases, m.Nr, m.Nz)
+        theta = initialise_theta(c.percolation, m.Nr, m.Nz)
+        k, psi, Lam = self._shape(T, theta)
+        rho = (k - 1.0) / k
+        q = source_amplitude_rate(self.phases, m, psi, self.v, self.q_density)
+        P = source_driven_steady_state(q, rho, Lam) if c.P0 is None else c.P0
+        st = State(0.0, T, omega, theta, psi, P, initialise_precursors(P, Lam),
+                   k, rho, Lam)
+        self.history.append(self._record(st))
+        return st
 
-        v = np.array([cfg.v1, 1.0 - cfg.v1])
+    def step(self, st: State, dt: float) -> State:
+        c, m, ph = self.cfg, self.mesh, self.phases
+        # A. kinetics
+        q = source_amplitude_rate(ph, m, st.psi, self.v, self.q_density)
+        P, C = advance_kinetics(st.P, st.C, st.rho, st.Lambda, dt, q)
+        # B. percolation -> latent-heat sink on the combustible phase
+        S_extra = None
+        theta = st.theta
+        if c.percolation.enabled:
+            theta, Gm, Gf = advance_percolation(st.theta, st.T[1], m.dz, dt, c.percolation)
+            S_extra = np.zeros_like(st.T)
+            S_extra[1] = -thermal_sink(Gm, Gf, c.percolation)
+        # D (before C). Pyrolysis, integrated EXACTLY over the step at the
+        # step's starting temperature, omega_new = omega exp(-kappa dt),
+        # with its heat released as exactly the energy of the material
+        # consumed, q (omega - omega_new) / dt. An explicit q*omega*rate
+        # source over-releases energy whenever rate*dt > 1 -- at 1200 K
+        # the rate is ~360 1/s, so a 1 s step released ~360x the energy
+        # present and drove T far above the furnace temperature.
+        omega = np.empty_like(st.omega)
+        S_c = np.zeros_like(st.T)
+        for p_, q_ph in enumerate(ph):
+            kap = (q_ph.k_arr * np.exp(-q_ph.E_act / (8.314 * np.maximum(st.T[p_], 1.0)))
+                   if q_ph.k_arr > 0 else np.zeros_like(st.T[p_]))
+            omega[p_] = st.omega[p_] * np.exp(-kap * dt)
+            S_c[p_] = q_ph.q * (st.omega[p_] - omega[p_]) / dt
+        S_extra = S_c if S_extra is None else S_extra + S_c
+        # C. conduction (fluxes at the step's new amplitude); combustion is
+        # supplied through S_extra, so the thermal step's own explicit
+        # combustion term is switched off by passing zero omega.
+        mu = self._mu(st.theta)
+        T = solve_thermal_step(ph, m, st.T, np.zeros_like(st.omega), P * st.psi, self.v,
+                               mu, mu, dt, c.T_f, c.h_conv, c.emissivity, c.Ef,
+                               T_amb=c.T_amb, S_extra=S_extra, closure="relaxational")
+        # E. shape
+        k, psi, Lam = self._shape(T, theta, psi_init=st.psi)
+        return State(st.t + dt, T, omega, theta, psi, P, C, k, (k - 1.0) / k, Lam)
 
-        # Eq. (78): T(r,z,0) = 300 K
-        T = np.full((2, Nr, Nz), cfg.T0)
+    def _record(self, st: State) -> dict:
+        return dict(t=st.t, k_eff=st.k_eff, rho=st.rho, P=st.P, Lambda=st.Lambda,
+                    T_max=float(st.T.max()), T_fuel_mean=float(st.T[0].mean()),
+                    T_mod_mean=float(st.T[1].mean()), omega2=float(st.omega[1].mean()))
 
-        # omega(r,z,0) = omega0 (uniform)
-        omega = initialise_omega(mats, mesh)
-
-        # Initial shape solve with BCs (83)-(84)
-        k_eff, psi = static_shape_solve(
-            mats, mesh, T, v, cfg.mu
-        )
-        Lambda = compute_Lambda(
-            mats, mesh, psi, T, cfg.neutron_speed
-        )
-
-        # Eqs. (79)-(80)
-        P = cfg.P0
-        C = initialise_precursors(P, Lambda)
-
-        phi = P * psi
-        rho = (k_eff - 1.0) / k_eff
-
-        state = State(
-            t=0.0, T=T, omega=omega, phi=phi,
-            psi=psi, P=P, C=C,
-            k_eff=k_eff, rho=rho, Lambda=Lambda,
-            v=v
-        )
-        self.history.append(self._record(state))
-        return state
-
-    def step(self, state: State) -> State:
-        cfg  = self.cfg
-        dt   = cfg.dt
-        mats = self.mats
-        mesh = self.mesh
-
-        # ── A: Point kinetics ──────────────────────────────────
-        P_new, C_new = advance_kinetics(
-            state.P, state.C,
-            state.rho, state.Lambda, dt
-        )
-
-        # ── B: Thermal solve ───────────────────────────────────
-        # BCs: Eqs. (76)-(77) at z=0
-        #      Eqs. (72)-(73) at all other boundaries
-        phi_new = P_new * state.psi
-        T_new   = solve_thermal_step(
-            mats, mesh,
-            state.T, state.omega,
-            phi_new, state.v,
-            cfg.mu, dt,
-            cfg.T_f, cfg.h_conv, cfg.emissivity,
-            cfg.Ef
-        )
-
-        # ── C: Pyrolysis ───────────────────────────────────────
-        omega_new = advance_pyrolysis(
-            mats, T_new, state.omega, dt
-        )
-
-        # ── D: Static shape solve ──────────────────────────────
-        # BCs: Eqs. (83)-(84) stochastic vacuum
-        k_new, psi_new = static_shape_solve(
-            mats, mesh, T_new, state.v, cfg.mu
-        )
-        Lambda_new = compute_Lambda(
-            mats, mesh, psi_new, T_new, cfg.neutron_speed
-        )
-        rho_new = (k_new - 1.0) / k_new
-
-        return State(
-            t      = state.t + dt,
-            T      = T_new,
-            omega  = omega_new,
-            phi    = P_new * psi_new,
-            psi    = psi_new,
-            P      = P_new,
-            C      = C_new,
-            k_eff  = k_new,
-            rho    = rho_new,
-            Lambda = Lambda_new,
-            v      = state.v.copy(),
-        )
-
-    def _adaptive_dt(self, state: State) -> float:
-        """Adaptive timestep."""
-        dt = self.cfg.dt
-
-        # Near prompt critical
-        margin = BETA - state.rho
-        if 0.0 < margin < 0.1 * BETA:
-            dt = min(dt,
-                     0.01 * abs(state.Lambda / margin))
-
-        # Thermal CFL
-        K_max  = max(m.K for m in self.mats)
-        rC_min = min(m.rho * m.Cp for m in self.mats)
-        dt_r   = 0.4 * rC_min * self.mesh.dr**2 / K_max
-        dt_z   = 0.4 * rC_min * self.mesh.dz**2 / K_max
-        dt     = min(dt, dt_r, dt_z)
-
-        # Pyrolysis stability
-        mat2     = self.mats[1]
-        T2_max   = float(state.T[1].max())
-        rate_max = mat2.k_arr * np.exp(
-            -mat2.E_act / (Rg * max(T2_max, 1.0))
-        )
-        if rate_max > 1e-30:
-            dt = min(dt, 0.1 / rate_max)
-
-        return max(dt, 1e-6)
-
-    def _record(self, state: State) -> dict:
-        return {
-            "t":          state.t,
-            "k_eff":      state.k_eff,
-            "rho":        state.rho,
-            "P":          state.P,
-            "Lambda":     state.Lambda,
-            "T1_max":     float(state.T[0].max()),
-            "T2_max":     float(state.T[1].max()),
-            "T1_mean":    float(state.T[0].mean()),
-            "T2_mean":    float(state.T[1].mean()),
-            # Track temperature at heated base z=0
-            "T1_base":    float(state.T[0][:, 0].mean()),
-            "T2_base":    float(state.T[1][:, 0].mean()),
-            "omega1":     float(state.omega[0].mean()),
-            "omega2":     float(state.omega[1].mean()),
-            "omega2_min": float(state.omega[1].min()),
-            "omega2_max": float(state.omega[1].max()),
-            "v1":         float(state.v[0]),
-            "v2":         float(state.v[1]),
-        }
-
-    def _check_safety(self, state: State) -> bool:
-        if state.rho >= BETA:
-            print(f"\n*** PROMPT CRITICAL ***")
-            print(f"    t     = {state.t:.4f} s")
-            print(f"    rho   = {state.rho:.6f}")
-            print(f"    beta  = {BETA:.6f}")
-            print(f"    k_eff = {state.k_eff:.6f}")
-            return True
-        return False
-
-    def run(self) -> List[dict]:
-        state = self.initialise()
-
-        print(f"Boundary conditions:")
-        print(f"  z=0  : h={self.cfg.h_conv} W/m2/K, "
-              f"T_f={self.cfg.T_f} K, "
-              f"eps={self.cfg.emissivity}")
-        print(f"  other: stochastic Neumann (Eqs.72-73)")
-        print(f"  neutronics: stochastic vacuum (Eqs.83-84)")
-        print()
-        print(f"{'t':>8} {'k_eff':>9} {'rho':>10} "
-              f"{'P':>10} {'T_base':>8} {'T_max':>8}")
-        print("-" * 60)
-
-        while state.t < self.cfg.t_end:
-            dt    = self._adaptive_dt(state)
-            state = self.step(state)
-            self.history.append(self._record(state))
-
-            if self._check_safety(state):
-                break
-
-            if len(self.history) % 10 == 0:
-                T_base = max(state.T[0][:,0].mean(),
-                             state.T[1][:,0].mean())
-                T_max  = max(state.T[0].max(),
-                             state.T[1].max())
-                print(
-                    f"{state.t:8.2f} "
-                    f"{state.k_eff:9.5f} "
-                    f"{state.rho:10.6f} "
-                    f"{state.P:10.3e} "
-                    f"{T_base:8.1f} "
-                    f"{T_max:8.1f}"
-                )
-
+    def run(self, verbose: bool = True) -> list:
+        c = self.cfg
+        st = self.initialise()
+        if verbose:
+            print(f"2D drum R={c.R} cm H={c.H} cm ({c.Nr}x{c.Nz}), mu={c.mu}, v1={c.v1:.4f}")
+            print(f"  k0={st.k_eff:.5f} rho0={st.rho:+.5f} Lambda={st.Lambda:.3e} s "
+                  f"P0={st.P:.4e} (source {self.q_density:.3e} n/s/cm^3 fuel)")
+            print(f"{'t':>7} {'k_eff':>8} {'rho':>9} {'P':>10} {'T_max':>7} "
+                  f"{'T_fuel':>7} {'T_mod':>7}")
+        n_print = max(1, int(round(10.0 / c.dt)))
+        n = 0
+        while st.t < c.t_end - 1e-9:
+            dt = min(c.dt, c.t_end - st.t)
+            if c.percolation.enabled:
+                dt = min(dt, adaptive_dt(st.theta, st.T[1], self.mesh.dz, c.percolation))
+            st = self.step(st, dt)
+            self.history.append(self._record(st))
+            n += 1
+            if verbose and n % n_print == 0:
+                h = self.history[-1]
+                print(f"{h['t']:7.1f} {h['k_eff']:8.5f} {h['rho']:+9.5f} {h['P']:10.3e} "
+                      f"{h['T_max']:7.1f} {h['T_fuel_mean']:7.1f} {h['T_mod_mean']:7.1f}")
+        self.last_state = st
         return self.history

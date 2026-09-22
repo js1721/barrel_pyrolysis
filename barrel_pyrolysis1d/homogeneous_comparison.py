@@ -33,8 +33,10 @@ from scipy.linalg import solve_banded
 
 from mesh import Mesh1D
 from materials import make_PuO, make_combustible, BETA, I_GRP
-from thermal import (H_flux, advance_pyrolysis, initialise_omega,
+from thermal import (H_flux, advance_pyrolysis, pyrolysis_step, initialise_omega,
                       _banded_matvec, CM_TO_M)
+from kinetics import source_driven_steady_state
+from sources import source_density as _pu_source_density
 from kinetics import advance_kinetics, initialise_precursors
 from neutronics import static_shape_solve, compute_Lambda
 from solver import Solver, Config
@@ -81,7 +83,15 @@ def nuSf_hom(phases, T, v):
 
 
 def D_hom(phases, v):
-    return _mix(v, phases[0].D, phases[1].D)
+    # Atomic mix: MACROSCOPIC cross sections combine linearly in volume
+    # fraction, and D = 1/(3 Sigma_tr), so D combines HARMONICALLY. (The
+    # superseded arithmetic average of D overstates leakage whenever the
+    # two phases' D differ -- here by factors of ~6.)
+    return 1.0 / _mix(v, 1.0 / phases[0].D, 1.0 / phases[1].D)
+
+
+def Ss12_hom(phases, v):
+    return _mix(v, phases[0].Sigma_s12, phases[1].Sigma_s12)
 
 
 def rCp_hom(phases, v):
@@ -95,69 +105,61 @@ def K_hom(phases, v):
 # ── Homogenised neutronics: single-region eigenvalue problem ─────────
 
 def static_shape_solve_hom(phases, mesh, T, v):
+    """
+    Two-group fundamental mode of the ATOMIC-MIX (homogenised) slab,
+    built exactly like one realisation of benchmark_markov.py but with
+    uniform mixed data: Marshak vacuum BC (d_ext = 2.1312 D), downscatter
+    Sigma_s12, chi = (1, 0). The model has one temperature, which is
+    therefore also the neutron temperature. Returns (k, psi) with psi
+    shape (2 groups, N), normalised to unit integrated total flux.
+    """
+    import scipy.sparse as sps
+    from scipy.sparse.linalg import splu, eigs, LinearOperator
     N, dz = mesh.N, mesh.dz
     T_mean = float(np.mean(T))
-    Sa   = Sa_hom(phases, T_mean, v)
-    nuSf = nuSf_hom(phases, T_mean, v)
-    D    = D_hom(phases, v)
-    d_ext = 0.7104 / Sa if Sa > 1e-10 else 10.0 * dz
-    r = D / dz**2
-
-    L = np.zeros((N, N))
-    F = np.zeros((N, N))
-    for n in range(N):
-        diag = Sa
-        if n == 0:
-            diag += r + D / (dz * d_ext)
-            L[n, n+1] -= r
-        elif n == N - 1:
-            diag += r + D / (dz * d_ext)
-            L[n, n-1] -= r
-        else:
-            diag += 2.0 * r
-            L[n, n-1] -= r
-            L[n, n+1] -= r
-        L[n, n] = diag
-        if nuSf > 1e-30:
-            F[n, n] = nuSf
-
-    # plain power iteration -- single region, no cross-phase source,
-    # no eigenvalue-selection pathology to worry about
-    Linv = np.linalg.inv(L)
-    psi = np.full(N, 1.0 / N)
-    k = 1.0
-    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
-        for _ in range(500):
-            src = F @ psi
-            # rhs divides by the CURRENT k estimate (matching neutronics.py's
-            # joint power iteration convention), so the fission-source ratio
-            # below converges to k_true/k_old and must be multiplied back by
-            # k_old -- NOT applied to a solve that already omits the 1/k
-            # (that mismatch is what caused the earlier exponential blowup).
-            psi_new = Linv @ (src / k)
-            src_new = F @ psi_new
-            k_new = k * (np.sum(src_new) / np.sum(src)) if np.sum(src) > 0 else k
-            scale = np.max(np.abs(psi_new))
-            if scale > 0:
-                psi_new /= scale
-            if abs(k_new - k) < 1e-9 * max(abs(k), 1.0):
-                psi, k = psi_new, k_new
-                break
-            psi, k = psi_new, k_new
-
-    norm = np.trapz(psi, mesh.z)
-    if norm > 0:
-        psi /= norm
+    Sa, nuSf = Sa_hom(phases, T_mean, v), nuSf_hom(phases, T_mean, v)
+    D, s12 = D_hom(phases, v), Ss12_hom(phases, v)
+    blocks = []
+    for g in range(2):
+        Srem = Sa[g] + (s12 if g == 0 else 0.0)
+        diag = np.full(N, Srem + 2.0 * D[g] / dz**2)
+        diag[[0, -1]] = Srem + D[g] / dz**2 + D[g] / ((2.1312 * D[g]) * dz)
+        off = np.full(N - 1, -D[g] / dz**2)
+        blocks.append(sps.diags([off, diag, off], [-1, 0, 1]))
+    Z = sps.csr_matrix((N, N))
+    M = sps.bmat([[blocks[0], Z], [sps.identity(N) * -s12, blocks[1]]], format="csc")
+    F = sps.bmat([[sps.identity(N) * nuSf[0], sps.identity(N) * nuSf[1]], [Z, Z]],
+                 format="csr")
+    lu = splu(M)
+    op = LinearOperator((2 * N, 2 * N), matvec=lambda x: lu.solve(F @ x), dtype=float)
+    vals, vecs = eigs(op, k=1, which="LM", tol=1e-12, maxiter=20000)
+    k = float(vals[0].real)
+    psi = vecs[:, 0].real
+    if psi.sum() < 0:
+        psi = -psi
+    psi = psi.reshape(2, N)
+    psi /= sum(np.trapezoid(psi[g], mesh.z) for g in range(2))
     return k, psi
 
 
 def compute_Lambda_hom(phases, mesh, psi, T, v):
-    T_mean = float(np.mean(T))
-    nuSf = nuSf_hom(phases, T_mean, v)
-    v_n  = phases[0].v_n   # identical for both phases in this model
-    num = np.trapz(psi, mesh.z) / v_n
-    den = np.trapz(nuSf * psi, mesh.z)
+    """Two-group generation time of the homogenised slab (unit weight)."""
+    nuSf = nuSf_hom(phases, float(np.mean(T)), v)
+    v_n = phases[0].v_n            # identical for both phases in this model
+    num = sum(np.trapezoid(psi[g], mesh.z) / v_n[g] for g in range(2))
+    den = sum(np.trapezoid(nuSf[g] * psi[g], mesh.z) for g in range(2))
     return num / den if abs(den) > 1e-30 else 1e-5
+
+
+def source_rate_hom(phases, mesh, psi, v, source_density):
+    """Intrinsic source in amplitude units/s (cf. neutronics.
+    source_amplitude_rate): the fuel's source density diluted by its
+    volume fraction, spread uniformly through the mixture."""
+    if not source_density:
+        return 0.0
+    v_n = phases[0].v_n
+    N_w = sum(np.trapezoid(psi[g], mesh.z) / v_n[g] for g in range(2))
+    return v[0] * source_density * mesh.H / N_w
 
 
 # ── Homogenised thermal: single-region Crank-Nicolson conduction ─────
@@ -179,7 +181,8 @@ def _build_conduction_matrix_hom(phases, mesh, dt, v):
 
 def solve_thermal_step_hom(phases, mesh, T, omega, phi, v, dt,
                             T_f, h_conv, emissivity, Ef,
-                            T_amb=None, h_conv_amb=None, emissivity_amb=None):
+                            T_amb=None, h_conv_amb=None, emissivity_amb=None,
+                            S_comb=None):
     N, dz = mesh.N, mesh.dz * CM_TO_M
     rCp = rCp_hom(phases, v)
     AB = _build_conduction_matrix_hom(phases, mesh, dt, v)
@@ -189,15 +192,23 @@ def solve_thermal_step_hom(phases, mesh, T, omega, phi, v, dt,
         emissivity_amb = emissivity
 
     T_mean = float(np.mean(T[0]))
-    S_f = Ef * Sf_hom(phases, T_mean, v) * phi[0]
+    Sf = Sf_hom(phases, T_mean, v)
+    # W/m^3: Sigma_f cm^-1 x phi n/cm^2/s = fissions/cm^3/s; x1e6 -> m^-3
+    S_f = 1.0e6 * Ef * (Sf[0] * phi[0][0] + Sf[1] * phi[0][1])
     # q_p * rate_p is already volumetric (W/m^3): omega is the density
     # (kg/m^3) of combustible content, not a dimensionless fraction --
     # see materials.py's omega0 comment and thermal.py's
     # solve_thermal_step for the matching convention -- so rate_p is a
     # volumetric mass-consumption rate (kg/m^3/s) with no separate rho
     # factor needed. v-weighted into the mixed medium as usual.
-    S_c = (v[0] * phases[0].q * _arrhenius(phases[0], T[0], omega[0])
-           + v[1] * phases[1].q * _arrhenius(phases[1], T[1], omega[1]))
+    # Combustion heat: supplied energy-exactly by the caller (S_comb, the
+    # mixture's volume-weighted q*(omega_old - omega_new)/dt from
+    # thermal.pyrolysis_step); the explicit form is kept only as fallback.
+    if S_comb is not None:
+        S_c = S_comb
+    else:
+        S_c = (v[0] * phases[0].q * _arrhenius(phases[0], T[0], omega[0])
+               + v[1] * phases[1].q * _arrhenius(phases[1], T[1], omega[1]))
     S_total = S_f + S_c
 
     rhs = 2.0 * T[0] - _banded_matvec(AB, T[0]) + dt / rCp * S_total
@@ -234,7 +245,13 @@ def run_homogeneous(cfg: Config):
 
     k_eff, psi = static_shape_solve_hom(phases, mesh, T, v)
     Lambda = compute_Lambda_hom(phases, mesh, psi, T, v)
-    P = cfg.P0
+    rho = (k_eff - 1.0) / k_eff
+    if cfg.source_density is not None:
+        q_dens = float(cfg.source_density)
+    else:
+        q_dens = _pu_source_density(cfg.isotopics, phases[0].rho * 1.0e-3)
+    q = source_rate_hom(phases, mesh, psi, v, q_dens)
+    P = source_driven_steady_state(q, rho, Lambda) if cfg.P0 is None else cfg.P0
     C = initialise_precursors(P, Lambda)
     phi = np.array([P * psi, P * psi])
     rho = (k_eff - 1.0) / k_eff
@@ -257,13 +274,16 @@ def run_homogeneous(cfg: Config):
             dt = min(dt, 0.01 * abs(Lambda) / scale)
         dt = max(dt, 1e-8)
 
-        P_new, C_new = advance_kinetics(P, C, rho, Lambda, dt)
+        q = source_rate_hom(phases, mesh, psi, v, q_dens)
+        P_new, C_new = advance_kinetics(P, C, rho, Lambda, dt, q)
         phi_new = np.array([P_new * psi, P_new * psi])
+        omega_new, S_cp = pyrolysis_step(phases, T, omega, dt)
         T = solve_thermal_step_hom(phases, mesh, T, omega, phi_new, v, dt,
                                     cfg.T_f, cfg.h_conv, cfg.emissivity, cfg.Ef,
                                     T_amb=cfg.T_amb, h_conv_amb=cfg.h_conv_amb,
-                                    emissivity_amb=cfg.emissivity_amb)
-        omega = advance_pyrolysis(phases, T, omega, dt)
+                                    emissivity_amb=cfg.emissivity_amb,
+                                    S_comb=v[0] * S_cp[0] + v[1] * S_cp[1])
+        omega = omega_new
         k_eff, psi = static_shape_solve_hom(phases, mesh, T, v)
         Lambda = compute_Lambda_hom(phases, mesh, psi, T, v)
         rho = (k_eff - 1.0) / k_eff
@@ -295,14 +315,18 @@ def _save(fig, name):
 
 if __name__ == "__main__":
     cfg_stoch = Config(
-        H=40.0, N=80, mu=0.05, v1=0.545,
+        # v1 bisected for k_eff(0) = 1 under the relaxational closure with
+        # joint eigenvalue and Marshak BC (was 0.545 under the superseded
+        # operator). NOTE: this script's homogeneous model is still
+        # single-group and cannot run against the two-group materials.
+        H=40.0, N=80, mu=0.5, v1=0.17229402357524248,   # stochastic k0 = 0.98
         t_end=300.0, dt=0.05,
-        T0=300.0, P0=1.0,
+        T0=300.0,
         T_f=1200.0, h_conv=50.0, emissivity=0.3,
         Ef=3.2e-11,
     )
 
-    # ── Finding 1: SAME composition (v1=0.545), different model ──────
+    # ── Finding 1: SAME composition (cfg_stoch.v1), different model ──
     # The stochastic model's k_eff = v1*k1 combines each phase's own
     # (leakage-inclusive) eigenvalue with a simple linear v-weighting
     # chosen earlier in this project -- it is NOT the same mathematical
@@ -310,7 +334,7 @@ if __name__ == "__main__":
     # equation (what "homogeneous" does below). So this is a genuine,
     # honestly-computed difference between the two models as built, not
     # a claim about which is "more correct" -- see the printed caveat.
-    print("=== Finding 1: same v1=0.545 in both models ===")
+    print(f"=== Finding 1: same v1={cfg_stoch.v1:.4f} in both models ===")
     phases = [make_PuO(), make_combustible()]
     mesh_chk = Mesh1D(cfg_stoch.H, cfg_stoch.N)
     T_chk = np.full((2, cfg_stoch.N), cfg_stoch.T0)
@@ -324,13 +348,13 @@ if __name__ == "__main__":
     print()
 
     # ── Finding 2: each model at its OWN near-critical v1, full 300s ──
-    # v1=0.081 found by bisection for k_eff(0)~1 in the homogeneous
+    # v1 found by bisection for k_eff(0) = 0.98 in the homogeneous
     # model specifically (very different from the stochastic model's
-    # v1=0.545 -- expected, given Finding 1).
+    # own critical v1 -- expected, given Finding 1).
     cfg_hom = Config(
-        H=40.0, N=80, mu=0.05, v1=0.08096321032164894,
+        H=40.0, N=80, mu=0.05, v1=0.09894598494912485,  # atomic-mix k0 = 0.98 (mu unused)
         t_end=300.0, dt=0.05,
-        T0=300.0, P0=1.0,
+        T0=300.0,
         T_f=1200.0, h_conv=50.0, emissivity=0.3,
         Ef=3.2e-11,
     )

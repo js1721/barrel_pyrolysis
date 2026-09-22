@@ -79,43 +79,51 @@ class Phase:
     # structure here (see make_combustible's comment).
     alpha_D: float = 0.0
 
-    def Sa_T(self, T: float) -> np.ndarray:
-        """
-        Absorption cm^-1, per group. FAST-group absorption (index 0)
-        is treated as T-independent: the 1/v Maxwellian-averaging
-        picture specifically describes a population in near-thermal
-        equilibrium with the material, which fast neutrons (freshly
-        born at ~MeV energies, far from equilibrium) are not -- at
-        this coarse 2-group resolution there's no physical basis for
-        giving the fast group its own T-dependence. THERMAL-group
-        absorption (index 1) keeps the original 1/v thermal-averaging
-        (sqrt(T_ref/T)) plus a Doppler resonance-broadening correction
-        (the alpha_D term): thermal motion of the absorber nucleus
-        broadens resonances as T rises, increasing effective
-        absorption -- a negative reactivity feedback. Sa_T(T_ref)[1]
-        = Sigma_a[1] exactly (both terms are referenced to zero at
-        T=T_ref).
-        """
+    # ── Temperature dependence ─────────────────────────────────────
+    # Two DIFFERENT temperatures enter the thermal group:
+    #
+    #   T_n : the NEUTRON temperature. The thermal-group cross sections
+    #         are averages over the thermal neutron spectrum, which
+    #         equilibrates with the MODERATOR (the hydrogenous
+    #         combustible), not with each material separately. A 1/v
+    #         cross section averaged over a Maxwellian at T_n scales as
+    #         sqrt(T_ref/T_n) -- for EVERY phase, fuel included.
+    #   T   : the material's own temperature, which enters only through
+    #         Doppler broadening of its resonances (the alpha_D term).
+    #
+    # The superseded form applied sqrt(T_ref/T) at each phase's OWN
+    # temperature. That made heating the fuel reduce its own thermal
+    # cross sections (a large spurious negative fuel coefficient,
+    # ~ -16% for 300->900 K in moderator-rich mixtures) -- but heating
+    # fuel atoms does not cool the neutron spectrum. T_n defaults to T,
+    # which reproduces the old behaviour exactly at uniform temperature
+    # (and so leaves the document's Doppler table unchanged). The
+    # absorption-hardening shift of T_n above the moderator temperature
+    # is not modelled.
+    #
+    # Fast-group cross sections stay T-independent: fast neutrons are
+    # far from thermal equilibrium with any material.
+
+    def Sa_T(self, T: float, T_n: float = None) -> np.ndarray:
+        """Absorption cm^-1, per group, at material temperature T and
+        neutron temperature T_n (default T). Sa_T(T_ref)[1] = Sigma_a[1]."""
         Tc = max(T, 1.0)
+        Tn = Tc if T_n is None else max(T_n, 1.0)
         thermal_factor = (
-            np.sqrt(self.T_ref / Tc)
+            np.sqrt(self.T_ref / Tn)
             + self.alpha_D * (np.sqrt(Tc) - np.sqrt(self.T_ref))
         )
         return np.array([self.Sigma_a[0], self.Sigma_a[1] * thermal_factor])
 
-    def Sf_T(self, T: float) -> np.ndarray:
-        """Fission cm^-1, per group. Thermal-averaging only in the
-        thermal group (see Sa_T note); fast group unchanged."""
-        Tc = max(T, 1.0)
-        thermal_factor = np.sqrt(self.T_ref / Tc)
-        return np.array([self.Sigma_f[0], self.Sigma_f[1] * thermal_factor])
+    def Sf_T(self, T: float, T_n: float = None) -> np.ndarray:
+        """Fission cm^-1, per group: 1/v at the neutron temperature."""
+        Tn = max(T, 1.0) if T_n is None else max(T_n, 1.0)
+        return np.array([self.Sigma_f[0], self.Sigma_f[1] * np.sqrt(self.T_ref / Tn)])
 
-    def nuSf_T(self, T: float) -> np.ndarray:
-        """nu*Sigma_f cm^-1, per group. Thermal-averaging only in the
-        thermal group (see Sa_T note); fast group unchanged."""
-        Tc = max(T, 1.0)
-        thermal_factor = np.sqrt(self.T_ref / Tc)
-        return np.array([self.nu_Sf[0], self.nu_Sf[1] * thermal_factor])
+    def nuSf_T(self, T: float, T_n: float = None) -> np.ndarray:
+        """nu*Sigma_f cm^-1, per group: 1/v at the neutron temperature."""
+        Tn = max(T, 1.0) if T_n is None else max(T_n, 1.0)
+        return np.array([self.nu_Sf[0], self.nu_Sf[1] * np.sqrt(self.T_ref / Tn)])
 
 
 def make_PuO() -> Phase:
@@ -237,8 +245,18 @@ def make_combustible() -> Phase:
         # artifact to tune away. See project history /
         # feedback_comparison.py.
 
-        # PVC pyrolysis (unchanged)
-        q       = 1.6e7,
+        # Heat released by PYROLYSIS of the volatile fraction, J/kg.
+        # Was 1.6e7 J/kg -- essentially PVC's heat of COMBUSTION (full
+        # oxidation, ~1.8e7 J/kg), which is released largely in the gas
+        # phase / flame, not deposited in the solid. With omega0 = 450
+        # kg/m^3 and rho*Cp = 7.2e5 J/m^3/K it implied an adiabatic rise
+        # of ~1e4 K, i.e. guaranteed ignition runaway in any energy-
+        # conserving scheme. 3.6e5 J/kg is the Bamford, Crank & Malan
+        # (1946) value used in Williams' pyrolysis preprint (adiabatic
+        # rise ~225 K). NOTE: real PVC dehydrochlorination is net
+        # ENDOTHERMIC; a PVC-specific value (and sign) should replace
+        # this generic wood-pyrolysis figure if available.
+        q       = 3.6e5,
         k_arr   = 2.0e13,
         E_act   = 1.46e5,
         # omega0: density of the COMBUSTIBLE/volatile fraction of this

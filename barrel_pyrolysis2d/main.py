@@ -1,241 +1,67 @@
+"""
+main.py  (2D axisymmetric r-z)
+==============================
+Furnace transient of a 200-litre PCM drum (R = 28.6 cm, H = 88 cm).
+
+Starting point: a subcritical STORED drum, k_eff(0) = 0.98, whose
+initial power is the source-driven steady state of the reactor-grade
+Pu intrinsic neutron source (no power is chosen). v1 = 0.1599 is the
+fuel-lean root of k_eff = 0.98 at mu = 0.5 cm^-1; this drum's k peaks
+near 1.22 around v1 ~ 0.5 (optimum moderation). A smaller 20 x 40 cm
+drum cannot reach 0.98 at any composition (k peaks ~0.93): radial
+leakage dominates.
+"""
+
+import os
+
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
 
 from solver import Solver, Config
-from materials import BETA
+from benchmark_markov2d import safety_report_2d, print_safety_report_2d
+
+FIGDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
 
 
-def plot_timeseries(history: list, cfg: Config):
-    t        = np.array([h["t"]          for h in history])
-    k_eff    = np.array([h["k_eff"]      for h in history])
-    rho      = np.array([h["rho"]        for h in history])
-    P        = np.array([h["P"]          for h in history])
-    T1_max   = np.array([h["T1_max"]     for h in history])
-    T2_max   = np.array([h["T2_max"]     for h in history])
-    T1_base  = np.array([h["T1_base"]    for h in history])
-    T2_base  = np.array([h["T2_base"]    for h in history])
-    omega2   = np.array([h["omega2"]     for h in history])
-    omega2mn = np.array([h["omega2_min"] for h in history])
-    omega2mx = np.array([h["omega2_max"] for h in history])
-    Lambda   = np.array([h["Lambda"]     for h in history])
+def plot(history, solver):
+    os.makedirs(FIGDIR, exist_ok=True)
+    t = np.array([h["t"] for h in history])
+    fig, ax = plt.subplots(1, 3, figsize=(13, 3.8))
+    ax[0].plot(t, [h["k_eff"] for h in history]); ax[0].set(xlabel="t (s)", ylabel="$k_{eff}$")
+    ax[1].semilogy(t, [h["P"] for h in history]); ax[1].set(xlabel="t (s)", ylabel="P (n cm/s)")
+    ax[2].plot(t, [h["T_fuel_mean"] for h in history], label="fuel (mean)")
+    ax[2].plot(t, [h["T_mod_mean"] for h in history], label="combustible (mean)")
+    ax[2].plot(t, [h["T_max"] for h in history], "k:", label="max")
+    ax[2].set(xlabel="t (s)", ylabel="T (K)"); ax[2].legend(fontsize=8)
+    fig.tight_layout(); fig.savefig(os.path.join(FIGDIR, "fig2d_timeseries.png"), dpi=150)
 
-    fig = plt.figure(figsize=(15, 10))
-    gs  = GridSpec(3, 3, figure=fig)
-    fig.suptitle(
-        "Stochastic Barrel Pyrolysis — 2D Cylindrical\n"
-        f"T_f={cfg.T_f}K, h={cfg.h_conv}W/m²K, "
-        f"ε={cfg.emissivity}",
-        fontsize=12
-    )
-
-    # k_eff
-    ax = fig.add_subplot(gs[0, 0])
-    ax.plot(t, k_eff, 'b')
-    ax.axhline(1.0, color='r', ls='--', label='Critical')
-    ax.set(xlabel='t (s)', ylabel=r'$k_\mathrm{eff}$',
-            title='Multiplication Factor')
-    ax.legend(); ax.grid(True)
-
-    # Reactivity
-    ax = fig.add_subplot(gs[0, 1])
-    ax.plot(t, rho*1e5, 'b', label=r'$\rho$')
-    ax.axhline(BETA*1e5, color='r', ls='--',
-                label=r'$\beta$')
-    ax.set(xlabel='t (s)',
-            ylabel=r'Reactivity ($\times10^{-5}$)',
-            title='Reactivity')
-    ax.legend(); ax.grid(True)
-
-    # Amplitude
-    ax = fig.add_subplot(gs[0, 2])
-    ax.semilogy(t, P, 'g')
-    ax.set(xlabel='t (s)', ylabel='P(t)',
-            title='Neutron Population')
-    ax.grid(True)
-
-    # Temperatures — max
-    ax = fig.add_subplot(gs[1, 0])
-    ax.plot(t, T1_max, 'r-',  label='PuO max')
-    ax.plot(t, T2_max, 'b-',  label='Comb. max')
-    ax.plot(t, T1_base,'r--', label='PuO base (z=0)')
-    ax.plot(t, T2_base,'b--', label='Comb. base (z=0)')
-    ax.axhline(cfg.T_f, color='k', ls=':', label='T_f')
-    ax.set(xlabel='t (s)', ylabel='T (K)',
-            title='Temperatures')
-    ax.legend(fontsize=7); ax.grid(True)
-
-    # Fuel fraction
-    ax = fig.add_subplot(gs[1, 1])
-    ax.plot(t, omega2, 'b', label=r'$\bar\omega_2$')
-    ax.fill_between(t, omega2mn, omega2mx,
-                     alpha=0.3, color='b',
-                     label='min/max')
-    ax.set(xlabel='t (s)', ylabel=r'$\omega_2$',
-            title='Combustible Fuel Fraction')
-    ax.legend(); ax.grid(True)
-
-    # Lambda
-    ax = fig.add_subplot(gs[1, 2])
-    ax.semilogy(t, Lambda, 'purple')
-    ax.set(xlabel='t (s)', ylabel=r'$\Lambda$ (s)',
-            title='Prompt Neutron Lifetime')
-    ax.grid(True)
-
-    plt.tight_layout()
-    plt.savefig("timeseries.png", dpi=150,
-                bbox_inches='tight')
-    plt.show()
-
-
-def plot_spatial_fields(solver: Solver, state):
-    mesh = solver.mesh
-
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
-    fig.suptitle(
-        f"Spatial Fields at t = {state.t:.1f} s",
-        fontsize=13
-    )
-
-    fields = [
-        (state.T[0],
-         "PuO Temperature (K)", 'hot'),
-        (state.T[1],
-         "Combustible Temp (K)", 'hot'),
-        (state.psi[0],
-         r"PuO Shape $\psi_1$", 'viridis'),
-        (state.psi[1],
-         r"Comb. Shape $\psi_2$", 'viridis'),
-        (state.omega[1],
-         r"Fuel Fraction $\omega_2$", 'Blues_r'),
-        (state.phi[0],
-         r"PuO Flux $\phi_1$", 'plasma'),
-    ]
-
-    for ax, (field, title, cmap) in zip(
-            axes.ravel(), fields):
-        im = ax.pcolormesh(
-            mesh.Z2D, mesh.R2D, field,
-            cmap=cmap, shading='auto'
-        )
-        plt.colorbar(im, ax=ax, shrink=0.8)
-        ax.set(xlabel='z (cm)', ylabel='r (cm)',
-               title=title)
-
-    plt.tight_layout()
-    plt.savefig(f"spatial_{state.t:.0f}s.png",
-                dpi=150, bbox_inches='tight')
-    plt.show()
-
-
-def plot_axial_profiles(solver: Solver, state):
-    mesh = solver.mesh
-    z    = mesh.z
-
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-    fig.suptitle(
-        f"Axial Profiles (centreline) at t={state.t:.1f} s",
-        fontsize=12
-    )
-
-    axes[0].plot(z, state.T[0][0,:], 'r-', label='PuO')
-    axes[0].plot(z, state.T[1][0,:], 'b-', label='Comb.')
-    axes[0].axvline(0, color='k', ls=':', label='z=0 (heated)')
-    axes[0].set(xlabel='z (cm)', ylabel='T (K)',
-                 title='Temperature')
-    axes[0].legend(fontsize=8); axes[0].grid(True)
-
-    axes[1].plot(z, state.psi[0][0,:], 'r-',
-                  label=r'$\psi_1$')
-    axes[1].plot(z, state.psi[1][0,:], 'b-',
-                  label=r'$\psi_2$')
-    axes[1].set(xlabel='z (cm)', ylabel=r'$\psi$',
-                 title='Flux Shape')
-    axes[1].legend(fontsize=8); axes[1].grid(True)
-
-    axes[2].plot(z, state.omega[1][0,:], 'b-',
-                  label='centre')
-    axes[2].plot(z, state.omega[1][-1,:], 'b--',
-                  label='edge')
-    axes[2].set(xlabel='z (cm)',
-                 ylabel=r'$\omega_2$',
-                 title='Fuel Fraction')
-    axes[2].legend(fontsize=8); axes[2].grid(True)
-
-    plt.tight_layout()
-    plt.savefig(f"axial_{state.t:.0f}s.png",
-                dpi=150, bbox_inches='tight')
-    plt.show()
-
-
-def print_summary(history: list, solver: Solver):
-    h   = history[-1]
-    cfg = solver.cfg
-    print("\n" + "="*55)
-    print("SIMULATION SUMMARY")
-    print("="*55)
-    print(f"Final time        : {h['t']:.2f} s")
-    print(f"Final k_eff       : {h['k_eff']:.6f}")
-    print(f"Final rho         : {h['rho']:.6f}")
-    print(f"Beta (Pu-239)     : {BETA:.6f}")
-    print(f"Final P(t)        : {h['P']:.4e}")
-    print(f"Final Lambda      : {h['Lambda']:.4e} s")
-    print(f"Final T_base mean : {h['T2_base']:.1f} K")
-    print(f"Final T_max       : {h['T2_max']:.1f} K")
-    print(f"Final omega2 mean : {h['omega2']:.5f}")
-    print(f"Final omega2 min  : {h['omega2_min']:.5f}")
-    print(f"Timesteps         : {len(history)}")
-    print(f"\nGeometry  : R={cfg.R}cm, H={cfg.H}cm")
-    print(f"Mesh      : Nr={cfg.Nr}, Nz={cfg.Nz}")
-    print(f"mu        : {cfg.mu} cm^-1")
-    print(f"v1        : {cfg.v1}")
-    print(f"T_f       : {cfg.T_f} K")
-    print(f"h_conv    : {cfg.h_conv} W/m^2/K")
-    print(f"emissivity: {cfg.emissivity}")
-    print("="*55)
+    st, m = solver.last_state, solver.mesh
+    fig, ax = plt.subplots(1, 3, figsize=(13, 4.2))
+    for a, (fld, title) in zip(ax, [(st.T[0], "fuel T (K)"), (st.T[1], "combustible T (K)"),
+                                    (st.psi[0, 1] * st.P, "fuel thermal flux (n/cm$^2$/s)")]):
+        pc = a.pcolormesh(m.r, m.z, fld.T, shading="auto")
+        fig.colorbar(pc, ax=a); a.set(xlabel="r (cm)", ylabel="z (cm)", title=f"{title}, t={st.t:.0f}s")
+    fig.tight_layout(); fig.savefig(os.path.join(FIGDIR, "fig2d_fields.png"), dpi=150)
+    print(f"Saved: {FIGDIR}/fig2d_timeseries.png, fig2d_fields.png")
 
 
 if __name__ == "__main__":
-
-    cfg = Config(
-        # Geometry
-        R           = 20.0,
-        H           = 40.0,
-        Nr          = 25,
-        Nz          = 50,
-
-        # Stochastics (mu_r = mu_z = mu)
-        mu          = 0.3,
-        v1          = 0.35,
-
-        # Time
-        t_end       = 200.0,
-        dt          = 0.1,
-
-        # ICs (Eqs. 78-80)
-        T0          = 300.0,
-        P0          = 1.0,
-
-        # Heating BC at z=0 (Eq. 66)
-        T_f         = 1200.0,
-        h_conv      = 50.0,
-        emissivity  = 0.9,
-
-        # Physics
-        neutron_speed = 2.2e5,
-        Ef            = 3.2e-11,
-    )
-
-    solver  = Solver(cfg)
+    cfg = Config(R=28.6, H=88.0, Nr=22, Nz=64, mu=0.5, v1=0.15988287397030493,
+                 t_end=300.0, dt=1.0, T0=300.0, T_f=1200.0, h_conv=50.0,
+                 emissivity=0.3, T_amb=300.0)
+    solver = Solver(cfg)
     history = solver.run()
+    h0, h1 = history[0], history[-1]
+    print(f"\nk_eff {h0['k_eff']:.5f} -> {h1['k_eff']:.5f};  P {h0['P']:.3e} -> {h1['P']:.3e} "
+          f"(x{h1['P']/h0['P']:.2f});  T_max {h1['T_max']:.1f} K")
 
-    print_summary(history, solver)
+    # See benchmark_markov2d.py's module docstring: this closed-form
+    # model's k_eff is a biased point estimate, and the realisation
+    # ensemble below is itself only a partial (radially-independent)
+    # benchmark -- likely a lower bound on the true clumping risk.
+    rep = safety_report_2d(cfg.mu, cfg.v1, solver.mesh, model_k=h0["k_eff"])
+    print_safety_report_2d(rep)
 
-    # Spatial plots at final state
-    state = solver.initialise()
-    for _ in range(min(len(history)-1, 100)):
-        state = solver.step(state)
-
-    plot_timeseries(history, cfg)
-    plot_spatial_fields(solver, state)
-    plot_axial_profiles(solver, state)
+    plot(history, solver)

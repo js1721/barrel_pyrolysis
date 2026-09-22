@@ -1,242 +1,214 @@
+"""
+neutronics.py  (2D axisymmetric r-z)
+=====================================
+Two-group, two-phase stochastic neutron diffusion on a cylindrical
+(r, z) mesh -- the 2D counterpart of barrel_pyrolysis1d/neutronics.py,
+built on the same basis:
+
+  * ONE eigenvalue for the coupled two-phase system (not per-phase
+    k_i weighted by volume fraction; see the 1D module for why);
+  * the RELAXATIONAL closure: phases exchange at the rate
+        G_i = v_k (D_i v_k + D_k v_i) |m|^2,   |m|^2 = mu_r^2 + mu_z^2,
+    with no odd-order drift terms;
+  * Marshak vacuum boundaries, d_ext = 2.1312 D, on z = 0, z = H and the
+    drum wall r = R; symmetry on the axis r = 0 (zero-area face);
+  * thermal-group 1/v factor at the NEUTRON temperature (the
+    moderator's), material temperature through Doppler only;
+  * absolute amplitude: phi = P psi in n/cm^2/s, with the fuel phase's
+    psi normalised to unit VOLUME integral (so P is in n cm/s), and the
+    intrinsic source entering point kinetics via source_amplitude_rate.
+
+Only the relaxational closure is provided in 2D. The document closure's
+odd-order terms were shown against the 1D realisation benchmark to give
+a negative combustible flux and no fundamental mode at moderate mu, so
+there is no reason to carry them into 2D.
+
+NOTE ON |m|^2. In 2D the exchange coefficient carries mu_r^2 + mu_z^2,
+twice the slab value when mu_r = mu_z. That follows from the closure,
+but it means the 1D and 2D models assign DIFFERENT exchange rates to the
+same isotropic medium. The realisation benchmark exists only in 1D, so
+the 2D exchange rate is unvalidated; a 2D (r-z) realisation benchmark
+is the way to settle it.
+
+Units: lengths cm, cross sections cm^-1, D cm, mu cm^-1.
+"""
+
+import warnings
 import numpy as np
-from scipy.sparse import lil_matrix, csr_matrix
-from scipy.sparse.linalg import eigs as sp_eigs
-from materials import Material, BETA, DELAYED_GROUPS
+import scipy.sparse as sps
+from scipy.sparse.linalg import splu, eigs, LinearOperator, ArpackNoConvergence
+
 from mesh import CylindricalMesh2D
-from stochastics import (coupling_coefficient_r,
-                          coupling_coefficient_z)
+from materials import N_GROUPS, CHI
+
+D_EXT_FACTOR = 2.1312       # Milne: 0.7104 * lambda_tr, lambda_tr = 3 D
 
 
-def build_static_system(mats: list,
-                          mesh: CylindricalMesh2D,
-                          T: np.ndarray,
-                          v: np.ndarray,
-                          mu: float) -> tuple:
+class ClosureBreakdownError(RuntimeError):
+    """Raised when there is no converged, physical fundamental mode."""
+
+
+def neutron_temperature(phases: list, T: np.ndarray) -> float:
+    """Mean temperature of the moderating phase (larger Sigma_s12)."""
+    m = int(np.argmax([ph.Sigma_s12 for ph in phases]))
+    return float(np.mean(T[m]))
+
+
+def cell_volumes(mesh: CylindricalMesh2D) -> np.ndarray:
+    """Annular cell volumes, cm^3, shape (Nr, Nz)."""
+    re = mesh.r_edge
+    ring = np.pi * (re[1:]**2 - re[:-1]**2)
+    return np.outer(ring, np.full(mesh.Nz, mesh.dz))
+
+
+def _group_loss(D: float, Srem: float, G_self: np.ndarray,
+                mesh: CylindricalMesh2D, radial_bc: str) -> sps.csr_matrix:
     """
-    Build loss matrix L and fission matrix F.
-
-    Vacuum BCs from Eqs. (83)-(84) of document:
-        psi1 + d_ext1*[psi1' + (1-v)*mu*(psi1-psi2)] = 0
-        psi2 + d_ext2*[psi2' - v*mu*(psi1-psi2)]     = 0
-
-    where d_ext,j = 1/Sigma_a,j  (document Eq. 84)
-
-    Symmetry BC at r=0:
-        d(psi)/dr = 0
+    Loss operator (per unit volume) for one phase and group:
+        -div(D grad psi) + (Sigma_removal + G) psi
+    finite volume on annular cells. Returns a sparse (N, N) matrix.
     """
-    Nr   = mesh.Nr
-    Nz   = mesh.Nz
-    N    = mesh.N
-    dr   = mesh.dr
-    dz   = mesh.dz
-    r    = mesh.r
-    re   = mesh.r_edge
-    size = 2 * N
+    Nr, Nz = mesh.Nr, mesh.Nz
+    dr, dz = mesh.dr, mesh.dz
+    r, re = mesh.r, mesh.r_edge
+    d_ext = D_EXT_FACTOR * D
+    rows, cols, vals = [], [], []
 
-    L = lil_matrix((size, size))
-    F = lil_matrix((size, size))
+    def add(a, b, x):
+        rows.append(a); cols.append(b); vals.append(x)
 
-    # mu_r = mu_z = mu as stated in document
-    G = coupling_coefficient_r(v[0], v[1], mu)
-
-    for j_ph, mat in enumerate(mats):
-        offset  = j_ph * N
-        T_j     = float(np.mean(T[j_ph]))
-        D_j     = mat.D_T(T_j)
-        Sa_j    = mat.Sigma_a_T(T_j)
-        Sf_j    = mat.Sigma_f_T(T_j)
-
-        # Phase-specific extrapolation distance
-        # From document Eq. (84): d_ext,j = 1/Sigma_a,j
-        d_ext = 1.0 / Sa_j if Sa_j > 1e-10 else 10.0 * dz
-
-        for i in range(Nr):
-            r_c = r[i]
-            r_m = re[i]
-            r_p = re[i + 1]
-
-            ar_m = D_j * r_m / (r_c * dr**2)
-            ar_p = D_j * r_p / (r_c * dr**2)
-            az   = D_j / dz**2
-
-            for j in range(Nz):
-                row     = offset + mesh.idx(i, j)
-                row_oth = (1 - j_ph)*N + mesh.idx(i, j)
-                diag    = Sa_j
-
-                # --- Radial diffusion ---
-                if i == 0:
-                    # Symmetry: d(psi)/dr = 0 at r=0
-                    # One-sided: only r_p term
-                    diag += ar_p
-                    if i + 1 < Nr:
-                        L[row, offset+mesh.idx(i+1,j)] -= ar_p
-
-                elif i == Nr - 1:
-                    # Vacuum BC at r=R (Eq. 83 or 84)
-                    # psi_j + d_ext_j*[psi_j' +/- coupling] = 0
-                    # Coupling term from stochastic BC:
-                    #   phase 1: +(1-v)*mu*(psi1-psi2)
-                    #   phase 2: -v*mu*(psi1-psi2)
-                    # Robin BC: D*dpsi/dr = -(D/d_ext)*psi
-                    #           + stochastic correction
-                    diag += ar_m + D_j / (dr * d_ext)
-                    L[row, offset+mesh.idx(i-1,j)] -= ar_m
-
-                    # Stochastic correction to vacuum BC
-                    if j_ph == 0:
-                        stoch_bc = (D_j * v[1] * mu
-                                    / d_ext)
-                    else:
-                        stoch_bc = (-D_j * v[0] * mu
-                                    / d_ext)
-                    diag        += stoch_bc
-                    L[row, row_oth] -= stoch_bc
-
-                else:
-                    diag += ar_m + ar_p
-                    L[row, offset+mesh.idx(i-1,j)] -= ar_m
-                    L[row, offset+mesh.idx(i+1,j)] -= ar_p
-
-                # --- Axial diffusion ---
-                if j == 0:
-                    # Vacuum BC at z=0 (Eq. 83 or 84)
-                    diag += az + D_j / (dz * d_ext)
-                    if j + 1 < Nz:
-                        L[row, offset+mesh.idx(i,j+1)] -= az
-
-                    # Stochastic correction to vacuum BC
-                    if j_ph == 0:
-                        stoch_bc = (D_j * v[1] * mu
-                                    / d_ext)
-                    else:
-                        stoch_bc = (-D_j * v[0] * mu
-                                    / d_ext)
-                    diag        += stoch_bc
-                    L[row, row_oth] -= stoch_bc
-
-                elif j == Nz - 1:
-                    # Vacuum BC at z=H (Eq. 83 or 84)
-                    diag += az + D_j / (dz * d_ext)
-                    L[row, offset+mesh.idx(i,j-1)] -= az
-
-                    # Stochastic correction
-                    if j_ph == 0:
-                        stoch_bc = (D_j * v[1] * mu
-                                    / d_ext)
-                    else:
-                        stoch_bc = (-D_j * v[0] * mu
-                                    / d_ext)
-                    diag        += stoch_bc
-                    L[row, row_oth] -= stoch_bc
-
-                else:
-                    diag += 2.0 * az
-                    L[row, offset+mesh.idx(i,j-1)] -= az
-                    L[row, offset+mesh.idx(i,j+1)] -= az
-
-                # --- Interior stochastic coupling ---
-                if j_ph == 0:
-                    diag        += v[1] * G
-                    L[row, row_oth] -= v[1] * G
-                else:
-                    diag        += v[0] * G
-                    L[row, row_oth] -= v[0] * G
-
-                L[row, row] = diag
-
-                # --- Fission ---
-                if mat.Sigma_f > 0:
-                    F[row, row] = mat.nu * Sf_j
-
-    return csr_matrix(L), csr_matrix(F)
+    for i in range(Nr):
+        for j in range(Nz):
+            n = mesh.idx(i, j)
+            diag = Srem + G_self[i, j]
+            # radial faces (area factor r_face / (r_c dr))
+            if i > 0:
+                c = D * re[i] / (r[i] * dr * dr)
+                diag += c
+                add(n, mesh.idx(i - 1, j), -c)
+            # i == 0: axis face has r_edge = 0 -> no flux (symmetry)
+            if i < Nr - 1:
+                c = D * re[i + 1] / (r[i] * dr * dr)
+                diag += c
+                add(n, mesh.idx(i + 1, j), -c)
+            elif radial_bc == "vacuum":
+                diag += D * re[i + 1] / (r[i] * dr) / d_ext
+            # radial_bc == "reflective": no outer-wall leakage
+            # axial faces
+            if j > 0:
+                diag += D / dz**2
+                add(n, mesh.idx(i, j - 1), -D / dz**2)
+            else:
+                diag += D / (dz * d_ext)
+            if j < Nz - 1:
+                diag += D / dz**2
+                add(n, mesh.idx(i, j + 1), -D / dz**2)
+            else:
+                diag += D / (dz * d_ext)
+            add(n, n, diag)
+    return sps.csr_matrix((vals, (rows, cols)), shape=(mesh.N, mesh.N))
 
 
-def static_shape_solve(mats: list,
-                         mesh: CylindricalMesh2D,
-                         T: np.ndarray,
-                         v: np.ndarray,
-                         mu: float) -> tuple:
+def _build_system(phases: list, mesh: CylindricalMesh2D, T: np.ndarray,
+                  v: np.ndarray, mu_r, mu_z, radial_bc: str):
+    """Joint loss A and fission F for [phase0 fast, phase0 thermal,
+    phase1 fast, phase1 thermal], each block N = Nr*Nz."""
+    N = mesh.N
+    shape = (mesh.Nr, mesh.Nz)
+    mr = np.broadcast_to(np.asarray(mu_r, dtype=float), shape)
+    mz = np.broadcast_to(np.asarray(mu_z, dtype=float), shape)
+    m2 = mr**2 + mz**2
+    T_n = neutron_temperature(phases, T)
+    I = sps.identity(N, format="csr")
+    Z = sps.csr_matrix((N, N))
+    A = [[None] * 4 for _ in range(4)]
+    Fb = [[Z] * 4 for _ in range(4)]
+    for p, ph in enumerate(phases):
+        k = 1 - p
+        po = phases[k]
+        Sa = ph.Sa_T(float(np.mean(T[p])), T_n)
+        nuSf = ph.nuSf_T(float(np.mean(T[p])), T_n)
+        for g in range(N_GROUPS):
+            Srem = Sa[g] + (ph.Sigma_s12 if g == 0 else 0.0)
+            G = v[k] * (ph.D[g] * v[k] + po.D[g] * v[p]) * m2   # relaxational
+            A[2 * p + g][2 * p + g] = _group_loss(ph.D[g], Srem, G, mesh, radial_bc)
+            A[2 * p + g][2 * k + g] = sps.diags(-G.ravel())
+        A[2 * p + 1][2 * p + 0] = -ph.Sigma_s12 * I          # downscatter
+        for g in range(N_GROUPS):                              # chi into groups
+            for gp in range(N_GROUPS):
+                if CHI[g] > 0 and nuSf[gp] > 0:
+                    Fb[2 * p + g][2 * p + gp] = CHI[g] * nuSf[gp] * I
+    for a in range(4):
+        for b in range(4):
+            if A[a][b] is None:
+                A[a][b] = Z
+    return sps.bmat(A, format="csc"), sps.bmat(Fb, format="csr")
+
+
+def static_shape_solve(phases: list, mesh: CylindricalMesh2D, T: np.ndarray,
+                       v: np.ndarray, mu_r, mu_z, psi_init=None,
+                       radial_bc: str = "vacuum") -> tuple:
     """
-    Solve static stochastic eigenvalue problem (Eq. 56)
-    with BCs from Eqs. (83)-(84).
+    Fundamental mode of the coupled two-phase system.
 
     Returns
     -------
     k_eff : float
-    psi   : shape (2, Nr, Nz), normalised per Eq. (52)
+    psi   : (2 phases, 2 groups, Nr, Nz); fuel phase normalised to unit
+            volume integral (summed over groups), the other phase scaled
+            by the same factor so psi_2/psi_1 is physical.
     """
-    Nr, Nz = mesh.Nr, mesh.Nz
-    N      = mesh.N
-
-    L, F = build_static_system(mats, mesh, T, v, mu)
-
+    A, F = _build_system(phases, mesh, T, v, mu_r, mu_z, radial_bc)
+    n = A.shape[0]
+    lu = splu(A)
+    op = LinearOperator((n, n), matvec=lambda x: lu.solve(F @ x), dtype=float)
+    x0 = (np.asarray(psi_init, float).ravel() if psi_init is not None
+          else np.ones(n))
     try:
-        vals, vecs = sp_eigs(
-            F, k=1, M=L,
-            sigma=1.0, which='LM',
-            tol=1e-8, maxiter=2000
-        )
-        k_eff    = float(np.real(vals[0]))
-        psi_flat = np.real(vecs[:, 0])
-    except Exception as e:
-        print(f"Sparse eigensolver failed: {e}")
-        from scipy.linalg import eig
-        vals, vecs = eig(F.toarray(), L.toarray())
-        real_mask  = np.abs(np.imag(vals)) < 1e-8
-        real_vals  = np.real(vals[real_mask])
-        real_vecs  = np.real(vecs[:, real_mask])
-        pos_mask   = real_vals > 0
-        if not np.any(pos_mask):
-            return 0.0, np.zeros((2, Nr, Nz))
-        idx      = np.argmax(real_vals[pos_mask])
-        k_eff    = float(real_vals[pos_mask][idx])
-        psi_flat = real_vecs[:, pos_mask][:, idx]
-
-    if np.mean(psi_flat) < 0:
-        psi_flat = -psi_flat
-
-    # Reshape to (2, Nr, Nz)
-    psi = np.zeros((2, Nr, Nz))
-    for j_ph in range(2):
-        psi[j_ph] = (
-            psi_flat[j_ph*N:(j_ph+1)*N].reshape(Nr, Nz)
-        )
-    psi = np.maximum(psi, 0.0)
-
-    # Normalise per Eq. (52): sum_i sum_g int psi_ig dV = 1
-    norm = sum(np.sum(psi[j] * mesh.dV) for j in range(2))
-    if norm > 0:
-        psi /= norm
-
+        vals, vecs = eigs(op, k=1, which="LM", v0=x0, tol=1e-12, maxiter=20000)
+    except ArpackNoConvergence as e:
+        raise ClosureBreakdownError(f"eigenvalue solve did not converge: {e}")
+    lam = vals[0]
+    if abs(lam.imag) > 1e-9 * max(abs(lam.real), 1.0) or lam.real <= 0:
+        raise ClosureBreakdownError(f"no physical fundamental mode (k = {lam!r})")
+    k_eff = float(lam.real)
+    psi = vecs[:, 0].real.reshape(2, N_GROUPS, mesh.Nr, mesh.Nz)
+    if psi[0].sum() < 0:
+        psi = -psi
+    Vc = cell_volumes(mesh)
+    s1 = float(np.sum(psi[0] * Vc[None, :, :]))
+    psi = psi / s1
+    if np.any(psi < -1e-8 * np.abs(psi).max()):
+        warnings.warn("fundamental mode changes sign: not physical",
+                      RuntimeWarning, stacklevel=2)
     return k_eff, psi
 
 
-def compute_Lambda(mats: list,
-                    mesh: CylindricalMesh2D,
-                    psi: np.ndarray,
-                    T: np.ndarray,
-                    neutron_speed: float = 2.2e5) -> float:
-    """
-    Compute prompt neutron lifetime from Eq. (58):
+def compute_Lambda(phases: list, mesh: CylindricalMesh2D, psi: np.ndarray,
+                   T: np.ndarray, v: np.ndarray) -> float:
+    """Generation time, volume-fraction weighted, unit weight function."""
+    Vc = cell_volumes(mesh)
+    T_n = neutron_temperature(phases, T)
+    num = den = 0.0
+    for p, ph in enumerate(phases):
+        nuSf = ph.nuSf_T(float(np.mean(T[p])), T_n)
+        for g in range(N_GROUPS):
+            num += v[p] * np.sum(psi[p, g] * Vc) / ph.v_n[g]
+            den += v[p] * np.sum(nuSf[g] * psi[p, g] * Vc)
+    return num / den if abs(den) > 1e-30 else 1e-5
 
-        Lambda = sum_i int(psi_i/v) dV
-               / sum_i int(nu*Sigma_fi*psi_i) dV
-    """
-    numerator   = 0.0
-    denominator = 0.0
 
-    for j_ph, mat in enumerate(mats):
-        T_j  = float(np.mean(T[j_ph]))
-        Sf_j = mat.Sigma_f_T(T_j)
-
-        numerator   += (np.sum(psi[j_ph] * mesh.dV)
-                        / neutron_speed)
-        denominator += np.sum(
-            mat.nu * Sf_j * psi[j_ph] * mesh.dV
-        )
-
-    if abs(denominator) < 1e-30:
-        return 1e-5
-
-    return numerator / denominator
+def source_amplitude_rate(phases: list, mesh: CylindricalMesh2D,
+                          psi: np.ndarray, v: np.ndarray,
+                          source_density: float) -> float:
+    """Intrinsic source in amplitude units/s (cf. the 1D function):
+    q = (sum_p v_p Q_p V) / (sum_p v_p sum_g int psi/v_n dV)."""
+    if not source_density:
+        return 0.0
+    Vc = cell_volumes(mesh)
+    V = float(Vc.sum())
+    S_tot = sum(v[p] * source_density * V
+                for p, ph in enumerate(phases) if np.any(ph.nu_Sf > 0))
+    N_w = sum(v[p] * np.sum(psi[p, g] * Vc) / ph.v_n[g]
+              for p, ph in enumerate(phases) for g in range(N_GROUPS))
+    return S_tot / N_w if N_w > 0 else 0.0

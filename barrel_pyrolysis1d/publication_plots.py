@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 
 from solver import Solver, Config
 from materials import BETA
+from benchmark_markov import safety_report, print_safety_report
 
 # ── Validated categorical palette (dataviz skill reference) ───────
 BLUE   = "#2a78d6"   # series 1: PuO
@@ -58,9 +59,9 @@ def _save(fig, name):
 
 def main():
     cfg = Config(
-        H=40.0, N=80, mu=0.0291785563199653, v1=0.7,   # critical run -- see main.py
+        H=40.0, N=80, mu=0.5, v1=0.17229402357524248,   # k0 = 0.98, source-driven -- see main.py
         t_end=300.0, dt=0.05,
-        T0=300.0, P0=1.0,
+        T0=300.0,
         T_f=1200.0, h_conv=50.0, emissivity=0.3, T_amb=300.0,
         Ef=3.2e-11,
     )
@@ -68,6 +69,12 @@ def main():
     history = solver.run()
     state   = solver.last_state
     z       = solver.mesh.z
+
+    # The closed-form (relaxational) closure is a biased point estimate of
+    # the true composition's criticality, not a substitute for it -- see
+    # HANDOFF.md "Open" items 1-2 and benchmark_markov.py.
+    rep = safety_report(cfg.mu, cfg.v1, H=cfg.H, model_k=history[0]["k_eff"])
+    print_safety_report(rep)
 
     t     = np.array([h["t"]      for h in history])
     k_eff = np.array([h["k_eff"]  for h in history])

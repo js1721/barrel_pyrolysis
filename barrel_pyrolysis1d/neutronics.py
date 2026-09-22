@@ -23,28 +23,30 @@ uniform field and reproduces the original behaviour exactly.
 
 Stochastic loss operator (Eq. 89), applied per-group g:
     L psi_i,g = D_i,g d^2(psi_i,g)/dz^2
-              + mu * d(psi_i,g)/dz
-              - mu * sum_k v_k * d(psi_k,g)/dz
-              - mu * sum_{l!=i} (D_l,g * d(psi_l,g)/dz
-                                 + mu * psi_l,g)
+              + 2*v_k*D_i,g * mu * d(psi_i,g)/dz
+              - v_k*mu*(D_i,g + D_k,g) * d(psi_k,g)/dz
+              + v_k*mu^2*(D_i,g*v_k + D_k,g*v_i)
+                        * (psi_i,g - psi_k,g)
 
 Expanding for two phases (same structure as the single-group model,
 just carried through per-group):
 
     Phase 1, group g:
         L psi_1,g = D_1,g d^2(psi_1,g)/dz^2
-                  + mu*(1-v_1)*d(psi_1,g)/dz
-                  - mu*(v_2 + D_2,g)*d(psi_2,g)/dz
-                  - mu^2 * psi_2,g
+                  + 2*v_2*D_1,g*mu*d(psi_1,g)/dz
+                  - v_2*mu*(D_1,g + D_2,g)*d(psi_2,g)/dz
+                  + v_2*mu^2*(D_1,g*v_2 + D_2,g*v_1)
+                            * (psi_1,g - psi_2,g)
 
     Phase 2, group g:
         L psi_2,g = D_2,g d^2(psi_2,g)/dz^2
-                  + mu*(1-v_2)*d(psi_2,g)/dz
-                  - mu*(v_1 + D_1,g)*d(psi_1,g)/dz
-                  - mu^2 * psi_1,g
+                  + 2*v_1*D_2,g*mu*d(psi_2,g)/dz
+                  - v_1*mu*(D_2,g + D_1,g)*d(psi_1,g)/dz
+                  + v_1*mu^2*(D_2,g*v_1 + D_1,g*v_2)
+                            * (psi_2,g - psi_1,g)
 
-Note: the self-drift (mu*(1-v_self)*dpsi_i/dz) and cross-gradient
-(mu*(v_other+D_other)*dpsi_other/dz) terms are odd-order (first-
+Note: the self-drift (2*v_k*D_i*mu*dpsi_i/dz) and cross-gradient
+(v_k*mu*(D_i+D_k)*dpsi_k/dz) terms are odd-order (first-
 derivative) terms with a fixed spatial sign, so they break z<->H-z
 mirror symmetry of the flux shape in an otherwise symmetric slab
 (uniform properties, vacuum BC at both ends) -- this is a genuine
@@ -91,6 +93,7 @@ Sigma_a alone for thermal -- no group above thermal to lose flux to):
 """
 
 import numpy as np
+import warnings
 from scipy.linalg import lu_factor, lu_solve
 
 from materials import Phase, CHI, N_GROUPS
@@ -104,7 +107,8 @@ def _build_group_self_and_cross(D: float,
                                  v_self: float,
                                  v_oth: float,
                                  mu,
-                                 is_phase0: bool) -> tuple:
+                                 is_phase0: bool,
+                                 closure: str = "relaxational") -> tuple:
     """
     Build ONE energy group's self and cross operators (Eq. 89) for one
     phase -- the same discretisation the single-group model used,
@@ -128,81 +132,146 @@ def _build_group_self_and_cross(D: float,
     -------
     A_self, Cross : (N,N) dense arrays
     """
-    N     = mesh.N
-    dz    = mesh.dz
-
+    N  = mesh.N
+    dz = mesh.dz
     mu = np.broadcast_to(np.atleast_1d(mu), (N,)).astype(float)
 
-    d_ext   = 0.7104 / Sigma_removal if Sigma_removal > 1e-10 else 10.0 * dz
-    r       = D / dz**2
-    s_self  = mu * (1.0 - v_self) / (2.0 * dz)          # shape (N,)
-    s_cross = mu * (v_oth + D_oth) / (2.0 * dz)         # shape (N,)
-    G_coup  = mu**2                                      # shape (N,)
+    if closure not in ("relaxational", "document"):
+        raise ValueError(f"unknown closure {closure!r}")
+
+    # Extrapolation distance for the vacuum boundary: the Milne-problem
+    # value 0.7104 * lambda_tr with lambda_tr = 3 D, i.e. 2.131 D.
+    # (The superseded 0.7104 / Sigma_removal used the REMOVAL cross
+    # section in place of the transport one. For weak absorbers that
+    # overstates d_ext enormously -- 75.7 cm instead of 0.28 cm for the
+    # combustible thermal group, on a 40 cm slab -- making the "vacuum"
+    # boundary nearly reflecting and inflating k.)
+    d_ext = 2.1312 * D
+
+    # ── Operator (document's active form, k = other phase) ─────────
+    #   L psi_i = D_i psi_i''
+    #           + v_k D_i d/dz[mu (psi_i - psi_k)]       (conservative)
+    #           + v_k D_i mu psi_i'                      (self drift)
+    #           - v_k D_k mu psi_k'                      (cross drift)
+    #           + v_k (D_i v_k + D_k v_i) mu^2 (psi_i - psi_k)  (algebraic)
+    #
+    # A_self and Cross are LOSS operators (-L), matching the removal
+    # term's sign: the phase system reads
+    #     A_self psi_i + Cross psi_k = (fission source).
+    #
+    # Finite-volume assembly. The first two terms are -d/dz of the
+    # TOTAL phase current
+    #     J_i = -D_i psi_i' - v_k D_i mu (psi_i - psi_k),
+    # assembled as face currents, so d(mu)/dz is retained when mu
+    # varies (percolation) and the vacuum BC can be imposed on the
+    # total current, as the physics requires. Central differencing
+    # (a static eigenproblem has no stability constraint on the drift).
+    #
+    # CORRECTIONS relative to the superseded builder:
+    #  * algebraic coupling sign: it implemented -G(psi_i - psi_k);
+    #    the document has +G. Note +G is anti-diffusive -- it REDUCES
+    #    the loss-operator diagonal, so at large mu the loss operator
+    #    can become indefinite. That is a property of the closure.
+    #  * top-boundary self drift: its one-sided stencil carried the
+    #    opposite sign to the interior (-2 v_k D mu psi' at z=H).
+    #  * the pointwise drift dropped the d(mu)/dz term.
+    #  * the separate "stoch_bc" boundary correction is gone: with the
+    #    stochastic current assembled on interior faces and the vacuum
+    #    condition imposed on the TOTAL boundary current, it is not
+    #    needed (and would double-count).
+    #  is_phase0 is no longer needed: the phase-dependent sign combines
+    #  with (psi_1 - psi_2) into (psi_i - psi_k), one form for both.
+    G = mu**2 * v_oth * (D * v_oth + D_oth * v_self)       # (N,)
+    c = v_oth * D
+
+    # CLOSURE SWITCH.
+    #  "document":     the operator written above (the document's active
+    #                  slab equation): odd-order drift/conservative terms
+    #                  and the algebraic coupling with the anti-diffusive
+    #                  sign +G (psi_i - psi_k).
+    #  "relaxational": no odd-order terms, algebraic coupling with the
+    #                  relaxational sign -G (psi_i - psi_k).
+    # The realisation-averaged benchmark (benchmark_markov.py) shows the
+    # document form gives a negative combustible-phase flux and loses
+    # its fundamental mode at moderate mu, while the relaxational form
+    # stays positive. It is benchmarked, NOT derived: it keeps the
+    # document's mu^2 exchange coefficient with the sign that the
+    # benchmark requires. With the joint eigenvalue and the Marshak BC
+    # it matches the benchmark k to ~1% at mu = 0.12 cm^-1 but is ~6%
+    # LOW (non-conservative) at mu = 0.5-2 cm^-1: the mu^2 exchange
+    # over-couples the phases at fine mixing.
+    relax = (closure == "relaxational")
+    if relax:
+        c = 0.0
 
     A_self = np.zeros((N, N))
     Cross  = np.zeros((N, N))
 
+    def add_face_current(f, coeff_i, coeff_k):
+        """Face f lies between cells f-1 and f. coeff_* map cell index ->
+        coefficient of the +z face current J_f. Loss in cell j is
+        (J_{j+1} - J_j)/dz."""
+        for cell, w in coeff_i.items():
+            if f - 1 >= 0: A_self[f - 1, cell] += w / dz
+            if f <= N - 1: A_self[f, cell]     -= w / dz
+        for cell, w in coeff_k.items():
+            if f - 1 >= 0: Cross[f - 1, cell] += w / dz
+            if f <= N - 1: Cross[f, cell]     -= w / dz
+
+    # Interior faces: diffusive + stochastic current, central average
+    for f in range(1, N):
+        jm, jp = f - 1, f
+        ci = {jm: D / dz - 0.5 * c * mu[jm],
+              jp: -D / dz - 0.5 * c * mu[jp]}
+        ck = {jm: 0.5 * c * mu[jm],
+              jp: 0.5 * c * mu[jp]}
+        add_face_current(f, ci, ck)
+
+    # Boundary faces: vacuum condition on the TOTAL outward current,
+    #   J_out = (D_i / d_ext) psi_i(boundary cell)
+    add_face_current(0, {0: -D / d_ext}, {})          # +z current at z=0
+    add_face_current(N, {N - 1: D / d_ext}, {})       # +z current at z=H
+
+    # Removal
     for n in range(N):
-        diag = Sigma_removal
+        A_self[n, n] += Sigma_removal
 
+    # Volumetric terms (enter the loss with a minus sign)
+    for n in range(N):
         if n == 0:
-            diag += r + D / (dz * d_ext)
-            A_self[n, n+1] -= r
-
-            # Vacuum-BC stochastic correction (Eqs. 78-79)
-            stoch_bc = D * v_oth * mu[n] / d_ext if is_phase0 else -D * v_oth * mu[n] / d_ext
-            diag        += stoch_bc
-            Cross[n, n] -= stoch_bc
-
-            # Self drift at z=0: one-sided forward diff
-            s0 = mu[n] * (1.0 - v_self) / dz
-            diag           += s0
-            A_self[n, n+1] -= s0
-
+            dm, dp, h = n, n + 1, dz
         elif n == N - 1:
-            diag += r + D / (dz * d_ext)
-            A_self[n, n-1] -= r
-
-            stoch_bc = D * v_oth * mu[n] / d_ext if is_phase0 else -D * v_oth * mu[n] / d_ext
-            diag        += stoch_bc
-            Cross[n, n] -= stoch_bc
-
-            # Self drift at z=H: one-sided backward diff
-            sN = mu[n] * (1.0 - v_self) / dz
-            diag           += sN
-            A_self[n, n-1] -= sN
-
+            dm, dp, h = n - 1, n, dz
         else:
-            diag += 2.0 * r
-            A_self[n, n-1] -= r
-            A_self[n, n+1] -= r
-
-            # Self drift: central difference
-            A_self[n, n+1] -= s_self[n]
-            A_self[n, n-1] += s_self[n]
-
-        # Cross-phase gradient coupling -- always references psi_other
-        # (same group -- see module docstring on why cross-phase
-        # coupling stays block-diagonal in group)
-        if 0 < n < N - 1:
-            Cross[n, n+1] += s_cross[n]
-            Cross[n, n-1] -= s_cross[n]
-        elif n == 0:
-            sc0 = mu[n] * (v_oth + D_oth) / dz
-            Cross[n, n+1] += sc0
-            Cross[n, n]   -= sc0
+            dm, dp, h = n - 1, n + 1, 2.0 * dz
+        if not relax:
+            # - v_k D_i mu psi_i'
+            A_self[n, dp] -= c * mu[n] / h
+            A_self[n, dm] += c * mu[n] / h
+            # + v_k D_k mu psi_k'   (negated cross drift)
+            Cross[n, dp] += v_oth * D_oth * mu[n] / h
+            Cross[n, dm] -= v_oth * D_oth * mu[n] / h
+            # - G (psi_i - psi_k)      [document: anti-diffusive]
+            A_self[n, n] -= G[n]
+            Cross[n, n]  += G[n]
         else:
-            scN = mu[n] * (v_oth + D_oth) / dz
-            Cross[n, n]   += scN
-            Cross[n, n-1] -= scN
-
-        # Direct coupling: -mu^2 * psi_other
-        diag        += G_coup[n]
-        Cross[n, n] -= G_coup[n]
-
-        A_self[n, n] += diag
+            # + G (psi_i - psi_k) in the loss  [relaxational]
+            A_self[n, n] += G[n]
+            Cross[n, n]  -= G[n]
 
     return A_self, Cross
+
+
+def neutron_temperature(phases: list, T: np.ndarray) -> float:
+    """
+    Temperature of the thermal neutron spectrum: the mean temperature of
+    the MODERATING phase, identified as the phase with the larger
+    fast->thermal downscatter cross section. See materials.py for why
+    the thermal-group 1/v factor of every phase uses this, not the
+    phase's own temperature.
+    """
+    m = int(np.argmax([ph.Sigma_s12 for ph in phases]))
+    return float(np.mean(T[m]))
 
 
 def _build_phase_system(ph: Phase,
@@ -212,7 +281,9 @@ def _build_phase_system(ph: Phase,
                          v_self: float,
                          v_oth: float,
                          mu,
-                         is_phase0: bool) -> tuple:
+                         is_phase0: bool,
+                         closure: str = "relaxational",
+                         T_n: float = None) -> tuple:
     """
     Assemble phase p's FULL 2-group (fast=0, thermal=1) system:
 
@@ -233,15 +304,15 @@ def _build_phase_system(ph: Phase,
     M, Cross, F : (2N, 2N) dense arrays
     """
     N    = mesh.N
-    Sa   = ph.Sa_T(T_p)     # [fast, thermal]
-    nuSf = ph.nuSf_T(T_p)   # [fast, thermal]
+    Sa   = ph.Sa_T(T_p, T_n)     # [fast, thermal]
+    nuSf = ph.nuSf_T(T_p, T_n)   # [fast, thermal]
 
     A_fast, Cross_fast = _build_group_self_and_cross(
         ph.D[0], ph_oth.D[0], Sa[0] + ph.Sigma_s12,
-        mesh, v_self, v_oth, mu, is_phase0)
+        mesh, v_self, v_oth, mu, is_phase0, closure)
     A_thermal, Cross_thermal = _build_group_self_and_cross(
         ph.D[1], ph_oth.D[1], Sa[1],
-        mesh, v_self, v_oth, mu, is_phase0)
+        mesh, v_self, v_oth, mu, is_phase0, closure)
 
     M = np.zeros((2 * N, 2 * N))
     M[0:N, 0:N]     = A_fast
@@ -333,6 +404,65 @@ def _solve_nonfissile_phase(lu_piv: tuple,
     return lu_solve(lu_piv, source)
 
 
+
+class ClosureBreakdownError(RuntimeError):
+    """Raised when the stochastic closure has no fundamental mode."""
+
+
+def closure_margin(phases: list, T: np.ndarray, v: np.ndarray, mu) -> list:
+    """
+    For each phase and group, the ratio
+
+        G_max / Sigma_removal,   G = v_k (D_i v_k + D_k v_i) mu^2
+
+    where G is the algebraic stochastic coupling. G enters the loss
+    operator with a NEGATIVE sign (it is anti-diffusive), so once it
+    reaches the removal cross section the loss operator can no longer
+    be guaranteed positive and the fundamental mode may cease to exist.
+    Ratios approaching 1 mean the closure is near breakdown -- a
+    property of the model, not of the discretisation.
+
+    Returns a list of (phase, group, ratio) tuples.
+    """
+    mu = np.atleast_1d(np.asarray(mu, dtype=float))
+    out = []
+    for p, ph in enumerate(phases):
+        k = 1 - p
+        po = phases[k]
+        Sa = ph.Sa_T(float(np.mean(T[p])), neutron_temperature(phases, T))
+        for g in range(N_GROUPS):
+            Sr = Sa[g] + (ph.Sigma_s12 if g == 0 else 0.0)
+            Gmax = float(np.max(mu**2)) * v[k] * (ph.D[g] * v[k] + po.D[g] * v[p])
+            out.append((p, g, Gmax / Sr if Sr > 0 else np.inf))
+    return out
+
+
+def _check_closure(phases, T, v, mu, k_eff, psi_arr, margin_limit=1.0,
+                   closure="document"):
+    """Raise ClosureBreakdownError rather than return garbage. The
+    coupling-vs-removal margin applies only to the document closure,
+    whose algebraic term subtracts from the loss diagonal; the
+    relaxational term adds to it."""
+    mx = float(np.max(np.atleast_1d(mu)))
+    for p, g, ratio in (closure_margin(phases, T, v, mu)
+                        if closure == "document" else []):
+        if ratio >= margin_limit:
+            raise ClosureBreakdownError(
+                f"stochastic coupling exceeds removal in phase {p+1}, "
+                f"group {g} (G/Sigma_r = {ratio:.3f}) at max mu = {mx:.4g} "
+                f"cm^-1: the loss operator is no longer positive and the "
+                f"model has no reliable fundamental mode.")
+    if not np.isfinite(k_eff) or k_eff <= 0.0:
+        raise ClosureBreakdownError(
+            f"eigenvalue solve returned k_eff = {k_eff!r} at max mu = "
+            f"{mx:.4g} cm^-1: the operator is indefinite or singular "
+            f"for this configuration.")
+    for p in range(len(phases)):
+        if not np.all(np.isfinite(psi_arr[p])):
+            raise ClosureBreakdownError(
+                f"non-finite flux in phase {p+1} at max mu = {mx:.4g} cm^-1.")
+
+
 def static_shape_solve(phases: list,
                          mesh: Mesh1D,
                          T: np.ndarray,
@@ -340,209 +470,174 @@ def static_shape_solve(phases: list,
                          mu,
                          psi_init: np.ndarray = None,
                          k_init: float = None,
-                         maxiter: int = 2000) -> tuple:
+                         maxiter: int = 2000,
+                         closure: str = "relaxational") -> tuple:
     """
-    Solve for each phase's OWN k-eigenvalue problem (Eq. 85, applied
-    per-phase rather than as one joint system, now spanning both
-    energy groups per phase -- see _build_phase_system), coupled via a
-    fixed-point iteration: each phase's cross-phase terms use the
-    OTHER phase's current flux (both groups) as a fixed external
-    source, updated each outer iteration until self-consistent.
+    Fundamental mode of the COUPLED two-phase system, one eigenvalue:
 
-    A phase with zero fission cross-section in BOTH groups (this
-    model: the combustible phase) has k_p = 0 identically; its flux is
-    obtained from a direct (non-eigenvalue) linear solve driven by the
-    fissile phase's flux.
+        [ M_1  C_1 ] [psi_1]   1  [ F_1  0  ] [psi_1]
+        [ C_2  M_2 ] [psi_2] = -  [ 0   F_2 ] [psi_2]
+                               k
 
-    The combined system k_eff is the volume-fraction-weighted average
-        k_eff = sum_p v_p * k_p
-    which (since k_combustible = 0) reduces to k_eff = v1 * k_PuO here
-    -- unchanged in form from the single-group model; each k_p is now
-    the dominant eigenvalue of that phase's 2-group system rather than
-    a single-group one, but the OUTER combination is identical. (A
-    joint 2Nx2N single-eigenvalue solve across PHASES -- as opposed to
-    the per-phase decomposition used here -- was tried instead and
-    reverted; see keff_crosscheck.py and git history. That question is
-    orthogonal to the energy-group extension here.)
+    where M_i, C_i, F_i are phase i's conditional-average loss, coupling
+    and fission operators (both energy groups).
 
-    This fixed-point iteration converges only linearly and can need
-    several hundred passes to fully settle (slower for larger mu) --
-    cheap per pass (each phase is a 2Nx2N solve, N~80) but not free.
-    Callers doing repeated solves across a slowly-changing sequence
-    (e.g. one per timestep) should pass the previous call's psi/k_eff
-    back in via psi_init/k_init: warm-starting from a solution that's
-    already close to self-consistent converges in a handful of passes
-    instead of hundreds.
+    WHY ONE EIGENVALUE. The superseded formulation solved a separate
+    eigenproblem per phase and reported k_eff = v_1 k_1 + v_2 k_2. That
+    is exact only for infinitely coarse mixing, where each realisation is
+    all one phase (a fraction v_1 of them pure fuel, the rest pure
+    moderator). At any finite chunk size moderator interleaved with fuel
+    raises k, which v_1 k_1 cannot see: against the realisation-averaged
+    benchmark it put criticality at v_1 = 0.67 where the random medium
+    is critical near 0.13 -- a large NON-conservative error. The joint
+    eigenvalue with the relaxational closure removes most of it, but a
+    bias remains: with the Marshak BC the model k is ~1% low at
+    mu = 0.12 cm^-1 and ~6% low at mu = 0.5-2 cm^-1 relative to the
+    benchmark (benchmark_markov.py). In the coarse limit (mu -> 0) the
+    joint k tends to the fuel phase's own eigenvalue -- the k of a drum
+    that CONTAINS fuel, near the benchmark median -- rather than the
+    ensemble mean, which also averages in drums with no fuel.
 
-    Vacuum BCs applied per document Eqs. (78)-(79):
-        z=0: minus sign
-        z=H: plus  sign
-
-    Normalised per phase, COMBINED across both groups (deviates from
-    Eq. (90)'s combined sum_i int psi_i dz = 1 across phases -- see
-    note above the normalisation code): int (psi_p,fast+psi_p,thermal)
-    dz = 1 for p=0 and p=1 independently, preserving the physically
-    meaningful fast/thermal ratio the coupled 2-group solve produces
-    within each phase (only the relative magnitude BETWEEN phases is
-    rescaled away, same as the single-group convention).
-
-    Parameters
-    ----------
-    phases   : [Phase1, Phase2]
-    mesh     : Mesh1D
-    T        : temperatures shape (2, N)
-    v        : volume fractions shape (2,)
-    mu       : inverse correlation length cm^-1 -- scalar OR shape
-               (N,). A spatially-varying field (e.g. from
-               percolation.mu_field()) is passed straight through to
-               _build_group_self_and_cross for both phases and both
-               groups; a scalar reproduces the original uniform-mu
-               behaviour exactly.
-    psi_init : optional warm-start shape (2, 2, N) [phase, group,
-               space], unnormalised is fine
-    k_init   : optional warm-start k_eff (this phase's k1 is
-               estimated as k_init/v[0] when the fissile phase is 0)
-    maxiter  : outer fixed-point iteration cap
+    NORMALISATION. psi_1 is scaled to unit integrated flux (summed over
+    groups), exactly as before, so the fission heating P*psi keeps its
+    meaning. psi_2 is scaled by the SAME factor, so the ratio
+    psi_2/psi_1 is physical (the old per-phase normalisation discarded
+    it). The eigenvector's overall sign is fixed jointly; the phases are
+    never flipped independently. A fundamental mode with a sign change
+    in either phase triggers a warning -- expected with
+    closure="document", which produces a negative combustible flux.
 
     Returns
     -------
     k_eff : float
-    psi   : shape (2, 2, N) [phase, group, space], normalised
+    psi   : (2, N_GROUPS, N) [phase, group, space]
     """
     N = mesh.N
     G = N_GROUPS
-
-    fissile = [bool(np.any(ph.nu_Sf > 1e-30)) for ph in phases]
-
-    ops = []
+    n = G * N
+    Ms, Cs, Fs = [], [], []
     for p, ph in enumerate(phases):
-        p_other = 1 - p
-        T_p = float(np.mean(T[p]))
-        M, Cross, F = _build_phase_system(
-            ph, phases[p_other], mesh, T_p,
-            v[p], v[p_other], mu, is_phase0=(p == 0)
-        )
-        # M is fixed for the whole outer fixed-point iteration (only
-        # psi_other, hence the source, changes each pass) --
-        # factorise once rather than re-solving from scratch every
-        # inner power-iteration step.
-        ops.append((lu_factor(M), Cross, F))
+        q = 1 - p
+        M, C, F = _build_phase_system(ph, phases[q], mesh,
+                                      float(np.mean(T[p])), v[p], v[q],
+                                      mu, p == 0, closure,
+                                      T_n=neutron_temperature(phases, T))
+        Ms.append(M); Cs.append(C); Fs.append(F)
+    A = np.block([[Ms[0], Cs[0]], [Cs[1], Ms[1]]])
+    Z = np.zeros((n, n))
+    Fj = np.block([[Fs[0], Z], [Z, Fs[1]]])
 
-    if psi_init is not None and np.max(np.abs(psi_init)) > 0:
-        scale = np.max(np.abs(psi_init))
-        psi = [psi_init[p].reshape(G * N) / scale for p in range(2)]
-        psi = [np.maximum(p_, 1e-12 * np.max(p_)) if np.max(p_) > 0
-               else np.full(G * N, 1.0 / N) for p_ in psi]
+    lu_piv = lu_factor(A)
+    if psi_init is not None and np.all(np.isfinite(psi_init)):
+        x0 = np.asarray(psi_init, dtype=float).reshape(-1).copy()
     else:
-        psi = [np.full(G * N, 1.0 / N), np.full(G * N, 1.0 / N)]
+        x0 = np.ones(2 * n)
 
-    if k_init is not None and k_init > 0:
-        fissile_idx = fissile.index(True) if True in fissile else 0
-        k = [(k_init / v[fissile_idx]) if (fissile[p] and v[fissile_idx] > 1e-12)
-             else 0.0 for p in range(2)]
-        if not any(fissile):
-            k = [0.0, 0.0]
-    else:
-        k = [1.0 if fissile[p] else 0.0 for p in range(2)]
+    # Arnoldi (ARPACK) on A^-1 F rather than plain power iteration: in
+    # large or loosely coupled systems the fundamental and first
+    # harmonic are nearly degenerate (dominance ratio -> 1) and power
+    # iteration crawls. The warm start x0 is used in transients.
+    from scipy.sparse.linalg import eigs, LinearOperator, ArpackNoConvergence
+    op = LinearOperator((2 * n, 2 * n), dtype=float,
+                        matvec=lambda y: lu_solve(lu_piv, Fj @ y))
+    converged = True
+    try:
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            vals, vecs = eigs(op, k=1, which="LM", v0=x0, tol=1e-12,
+                              maxiter=max(maxiter, 1000))
+    except ArpackNoConvergence:
+        converged = False
+        vals, vecs = np.array([np.nan + 0j]), np.full((2 * n, 1), np.nan)
+    lam = vals[0]
+    if converged and abs(lam.imag) > 1e-9 * max(abs(lam.real), 1.0):
+        raise ClosureBreakdownError(
+            f"dominant eigenvalue is complex ({lam!r}) (closure={closure!r}, "
+            f"max mu = {float(np.max(np.atleast_1d(mu))):.4g} cm^-1): "
+            f"no physical fundamental mode.")
+    k_eff = float(lam.real)
+    x = vecs[:, 0].real
 
-    # np.linalg.solve's internal LAPACK LU decomposition can leave
-    # stale FPU exception flags set even for a well-conditioned,
-    # correct solve (it divides by pivots internally); numpy reports
-    # these on whatever array op it next checks, which is spurious
-    # here -- verified all results below are finite and correct.
-    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
-        for _ in range(maxiter):
-            psi_prev = [p_.copy() for p_ in psi]
-            k_prev   = list(k)
-
-            for p in range(2):
-                p_other = 1 - p
-                lu_piv, Cross, F = ops[p]
-                if fissile[p]:
-                    k[p], psi[p] = _solve_fissile_phase(
-                        lu_piv, Cross, F, psi[p_other],
-                        k_init=k[p], psi_init=psi[p]
-                    )
-                else:
-                    k[p]   = 0.0
-                    psi[p] = _solve_nonfissile_phase(lu_piv, Cross, psi[p_other])
-
-            dk = max(abs(k[p] - k_prev[p]) for p in range(2))
-            dpsi = max(
-                np.max(np.abs(psi[p] - psi_prev[p])) / max(np.max(np.abs(psi[p])), 1e-300)
-                for p in range(2)
-            )
-            # 1e-6 relative is already far tighter than anything else
-            # in this model is resolved to; the fixed-point iteration
-            # only converges linearly, so demanding more (e.g. 1e-9)
-            # costs many extra passes for no physically meaningful gain.
-            if dk < 1e-6 * max(max(abs(kk) for kk in k), 1.0) and dpsi < 1e-6:
-                break
-
-    k_eff = sum(v[p] * k[p] for p in range(2))
-
-    psi_arr = np.zeros((2, G, N))
-    psi_arr[0] = psi[0].reshape(G, N)
-    psi_arr[1] = psi[1].reshape(G, N)
-
-    # NOTE: no np.maximum(psi_arr, 0.0) clip here. The combustible
-    # phase's flux genuinely goes negative near z=0 at some (mu, v1)
-    # -- confirmed to be a real, mesh- and discretisation-independent
-    # property of Eq. 89's cross-coupling terms combined with the
-    # per-phase fixed-source decomposition (see static_shape_solve's
-    # docstring / project history), not a numerical artifact to be
-    # papered over. Left visible deliberately as a known model
-    # limitation rather than silently clipped.
-
-    # Ensure positive fundamental mode and normalise EACH PHASE
-    # separately, combined across both groups: int (psi_p,fast +
-    # psi_p,thermal) dz = 1 for p=0 and p=1 independently (deviates
-    # from Eq. 90's sum_i int psi_i dz = 1 combined-across-PHASES
-    # normalisation -- see project history for the tradeoff this
-    # makes on P(t)'s interpretation as a combined "total neutron
-    # population" and on the relative fission-heating weight between
-    # phases in phi = P*psi). Groups are normalised TOGETHER (not
-    # independently) to preserve the physically meaningful fast/
-    # thermal ratio the coupled solve produces.
+    psi = x.reshape(2, G, N)
+    if psi[0].sum() < 0:                  # one joint sign, never per phase
+        psi = -psi
+    s1 = sum(np.sum(psi[0, g]) * mesh.dz for g in range(G))
+    if s1 > 0:
+        psi = psi / s1
     for p in range(2):
-        if np.sum(psi_arr[p]) < 0:
-            psi_arr[p] = -psi_arr[p]
-        norm_p = sum(np.trapz(psi_arr[p, g], mesh.z) for g in range(G))
-        if norm_p > 0:
-            psi_arr[p] /= norm_p
+        if v[p] > 0 and np.any(psi[p] < -1e-8 * np.abs(psi).max()):
+            warnings.warn(
+                f"fundamental mode changes sign in phase {p+1} "
+                f"(closure={closure!r}, max mu = "
+                f"{float(np.max(np.atleast_1d(mu))):.4g} cm^-1): the "
+                f"conditional flux is not physical.", RuntimeWarning,
+                stacklevel=2)
 
-    return k_eff, psi_arr
+    _check_closure(phases, T, v, mu, k_eff, psi, closure=closure)
+    if not converged:
+        raise ClosureBreakdownError(
+            f"coupled eigenvalue iteration did not converge in {maxiter} "
+            f"iterations (closure={closure!r}, max mu = "
+            f"{float(np.max(np.atleast_1d(mu))):.4g} cm^-1, last k_eff = "
+            f"{k_eff:.6g}).")
+    return k_eff, psi
+
+def source_amplitude_rate(phases: list, mesh: Mesh1D, psi: np.ndarray,
+                          v: np.ndarray, source_density: float) -> float:
+    """
+    External source expressed in amplitude units per second, the q in
+    kinetics.advance_kinetics. With phi = P psi (phi in n/cm^2/s) and
+    the same unit weight function as compute_Lambda,
+
+        q = S_tot / N_w,
+        S_tot = sum_p v_p * int Q_p dz         (source neutrons / cm^2 / s)
+        N_w   = sum_p v_p sum_g int psi_p,g / v_n,p,g dz,
+
+    so that Lambda = N_w / F_w and q enter the point-kinetics balance
+    consistently. Q is source_density (n/s/cm^3 of fuel phase) in the
+    fissile phase(s), zero elsewhere; the unit weight counts source
+    neutrons regardless of the group they are born in.
+    """
+    if not source_density:
+        return 0.0
+    S_tot = sum(v[p] * source_density * mesh.H
+                for p, ph in enumerate(phases) if np.any(ph.nu_Sf > 0))
+    N_w = sum(v[p] * np.sum(psi[p, g]) * mesh.dz / ph.v_n[g]
+              for p, ph in enumerate(phases) for g in range(N_GROUPS))
+    return S_tot / N_w if N_w > 0 else 0.0
 
 
+# Integrals over the slab are finite-volume CELL SUMS, sum(f) * dz,
+# consistent with the finite-volume discretisation and with the source
+# integral (which uses the full height H). np.trapezoid over cell centres
+# omits the half-cells at both ends -- an O(dz) inconsistency (~1e-3 in
+# Lambda and the source-driven flux at N = 80) exposed by the 2D
+# reduction test.
 def compute_Lambda(phases: list,
                     mesh: Mesh1D,
                     psi: np.ndarray,
-                    T: np.ndarray) -> float:
+                    T: np.ndarray,
+                    v: np.ndarray = None) -> float:
     """
-    Prompt neutron lifetime from Eq. (92), summed over phases AND
-    energy groups:
+    Prompt neutron generation time, summed over phases and groups with
+    each phase weighted by its volume fraction (the ensemble average of
+    a conditional quantity is sum_p v_p * <.>_p):
 
-        Lambda = sum_i sum_g int(psi_i,g / v_n,i,g) dz
-               / sum_i sum_g int(nu*Sf_i,g * psi_i,g) dz
+        Lambda = sum_p v_p sum_g int(psi_p,g / v_n,p,g) dz
+               / sum_p v_p sum_g int(nu*Sf_p,g * psi_p,g) dz
 
-    Parameters
-    ----------
-    psi : shape (2, 2, N) [phase, group, space]
-    T   : shape (2, N)
+    With psi from the joint eigenproblem the phases carry their physical
+    relative amplitudes, so the v_p weights are required; the superseded
+    unweighted sum was only harmless while each phase was normalised
+    separately. v=None reproduces the unweighted sum.
 
-    Returns
-    -------
-    Lambda : float (s)
+    psi : (2, 2, N) [phase, group, space];  T : (2, N)
     """
+    w = np.ones(len(phases)) if v is None else np.asarray(v, dtype=float)
     num = 0.0
     den = 0.0
-
     for p, ph in enumerate(phases):
-        T_p  = float(np.mean(T[p]))
-        nuSf = ph.nuSf_T(T_p)   # [fast, thermal]
-
+        nuSf = ph.nuSf_T(float(np.mean(T[p])), neutron_temperature(phases, T))
         for g in range(N_GROUPS):
-            num += np.trapz(psi[p, g], mesh.z) / ph.v_n[g]
-            den += np.trapz(nuSf[g] * psi[p, g], mesh.z)
-
+            num += w[p] * np.sum(psi[p, g]) * mesh.dz / ph.v_n[g]
+            den += w[p] * np.sum(nuSf[g] * psi[p, g]) * mesh.dz
     return num / den if abs(den) > 1e-30 else 1e-5
