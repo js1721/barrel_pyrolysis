@@ -95,7 +95,10 @@ def neutronics_convergence(H=2000.0, N_values=(20, 40, 80, 160, 320, 640)):
     # group, matching the single-group model's original convention);
     # see module docstring on why H must be large for this shared-B
     # formula to hold.
-    d_ext = 0.7104 / Sa1
+    # Milne extrapolation distance 0.7104*lambda_tr = 2.1312 D, the same
+    # convention as neutronics._build_group_self_and_cross (the reference
+    # must use the solver's boundary condition to test the solver).
+    d_ext = 2.1312 * D1
     B = np.pi / (H + 2 * d_ext)
     B2 = B**2
     k_analytical = (nuSf0 + nuSf1 * Ss12 / (D1*B2 + Sa1)) / (D0*B2 + Sa0 + Ss12)
@@ -238,3 +241,12 @@ if __name__ == "__main__":
     print()
     print("=== Test 2b: thermal convergence ===")
     thermal_convergence()
+    print()
+    # Tests 1-2b all run at mu = 0, which switches the stochastic closure
+    # off entirely. Test 3 exercises the closure itself (mu != 0): it is
+    # what catches sign or coefficient errors in the drift and coupling
+    # terms, which Tests 1-2b cannot see.
+    print("=== Test 3: stochastic operators at mu != 0 (operator_tests.py) ===")
+    import os, runpy
+    runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "operator_tests.py"), run_name="__main__")

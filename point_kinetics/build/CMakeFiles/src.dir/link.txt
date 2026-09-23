@@ -1,0 +1,2 @@
+/usr/bin/ar qc libsrc.a CMakeFiles/src.dir/src/pk/mod_cvode_wrapper.F90.o CMakeFiles/src.dir/src/pk/mod_pk.F90.o CMakeFiles/src.dir/src/pk/mod_pk_solver.F90.o CMakeFiles/src.dir/src/diffusion/mod_mesh.F90.o
+/usr/bin/ranlib libsrc.a

@@ -11,6 +11,7 @@ from matplotlib.gridspec import GridSpec
 
 from solver import Solver, Config, State
 from materials import BETA
+from percolation import PercolationConfig
 
 FIGDIR = "figures"
 os.makedirs(FIGDIR, exist_ok=True)
@@ -225,40 +226,43 @@ def print_summary(history: list, solver: Solver):
 
 if __name__ == "__main__":
 
+    # TODO: PLACEHOLDER -- copied verbatim from percolation.py's own
+    # self-test (see its __main__ block). These are illustrative values
+    # chosen to exercise melting/drainage/flashing in a synthetic test,
+    # NOT fitted to the real PVC-dominated waste case. Do not treat any
+    # number below as a physical result until it's been replaced with a
+    # fitted/sourced value. See HANDOFF.md, "Outstanding" item 2.
+    # DISABLED: with ell0 = 1/0.3 cm the dry correlation length gives
+    # mu0 = 0.3 cm^-1 at t=0, above the stochastic closure's breakdown
+    # (the algebraic coupling exceeds the combustible thermal-group
+    # removal near mu ~ 0.2 cm^-1 at this composition), so
+    # static_shape_solve now raises ClosureBreakdownError immediately.
+    # Re-enable only with an ell0 (and ell_max) that keep
+    # mu = 1/ell below that threshold -- see neutronics.closure_margin.
+    percolation_cfg = PercolationConfig(
+        enabled=False,
+        theta_r=0.02, theta_s=0.30,
+        T_melt=400.0, T_boil=900.0,
+        k_melt=0.05, k_flash=0.02,
+        L_fus=2.0e5, L_vap=8.0e5, rho_liquid=900.0,
+        K_sat=0.05, n_perc=3.0,
+        ell0=1.0/0.3, ell_max=15.0, theta_c=0.25, s0_perc=1.0, p_perc=4.0,
+    )
+
     cfg = Config(
+        percolation = percolation_cfg,
         H           = 40.0,
         N           = 80,
-        mu          = 0.0291785563199653,
-        v1          = 0.7,
-                              # Re-tuned for the two-group model: bisected
-                              # mu (v1=0.7 fixed) for k_eff(0)=1.000000.
-                              # v1=0.7 was chosen deliberately, not just
-                              # for convenience -- the per-phase fixed-
-                              # point solve's inner power iteration was
-                              # found to become numerically unstable
-                              # (k(v1) discontinuous, even briefly
-                              # negative) for v1 roughly in [0.83, 0.98]
-                              # at mu~0.1-0.2, most likely two of the 2N
-                              # system's eigenvalues becoming closely
-                              # spaced/near-degenerate there and breaking
-                              # the plain power iteration's dominant-
-                              # eigenvalue assumption (same failure mode
-                              # family as the earlier "fuller form"
-                              # spurious-eigenvalue issue from project
-                              # history, now via a different mechanism --
-                              # energy groups instead of drift-term
-                              # discretisation). v1=0.7 sits well inside
-                              # the confirmed-smooth, confirmed-stable
-                              # region (checked v1 in [0.1,0.82] and
-                              # +/-0.01 around this exact point). This
-                              # solver robustness gap is a known
-                              # limitation to revisit -- see project
-                              # history -- not something papered over by
-                              # this parameter choice.
+        # mu and v1 (relaxational closure, joint eigenvalue, Marshak BC):
+        # criticality by composition exists only for mu > ~0.071 cm^-1.
+        # Below that the fuel chords exceed ~14 cm, a single fuel chunk is
+        # supercritical on its own, and k > 1 for every composition. v1 is
+        # bisected for k_eff(0) = 0.98 at the chosen mu (source-driven start).
+        mu          = 0.5,        # chords ~3-6 cm; model k ~6% below benchmark here
+        v1          = 0.17068927633801423,    # subcritical storage state, k_eff(0) = 0.98 (a choice -- change v1 to change it); the initial power follows from the reactor-grade Pu intrinsic source, see Config.P0 / sources.py
         t_end       = 300.0,
         dt          = 0.05,
         T0          = 300.0,
-        P0          = 1.0,
         T_f         = 1200.0,
         h_conv      = 50.0,
         emissivity  = 0.3,

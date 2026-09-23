@@ -1,0 +1,1 @@
+/opt/homebrew/bin/gfortran  -ffree-line-length-none  -O0 -fcheck=all -fdec -DDEBUG -fopenmp -finit-real=snan -finit-integer=-9999 -ffpe-trap=invalid,zero,overflow -pedantic  CMakeFiles/out.dir/src/test.F90.o -o /Users/joe/Desktop/Postgraduate/ICL_Kinetics/Joe/2D_Diffusion/out  libsrc.a /Users/joe/Documents/petsc/arch-darwin-c-debug/lib/libpetsc.dylib

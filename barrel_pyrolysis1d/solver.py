@@ -28,10 +28,14 @@ from materials import (make_PuO, make_combustible,
 from mesh import Mesh1D
 from thermal import (solve_thermal_step,
                       advance_pyrolysis,
+                      pyrolysis_step,
                       initialise_omega,
                       arrhenius_rate)
 from neutronics import (static_shape_solve,
-                         compute_Lambda)
+                         compute_Lambda,
+                         source_amplitude_rate)
+from kinetics import source_driven_steady_state
+from sources import source_density as _pu_source_density
 from kinetics import (advance_kinetics,
                        initialise_precursors)
 from percolation import (PercolationConfig,
@@ -54,6 +58,18 @@ class Config:
     mu:   float = 0.3
     v1:   float = 0.35
 
+    # Stochastic closure, used by BOTH thermal and neutronics:
+    #   "relaxational" (default) -- relaxational inter-phase exchange,
+    #       no odd-order drift terms; checked against the realisation-
+    #       averaged benchmark (benchmark_markov.py): correct sign and
+    #       rate scaling and positive fluxes, but k ~6% low (non-
+    #       conservative) at mu = 0.5-2 cm^-1.
+    #   "document" -- the document's active slab equation (odd-order
+    #       drift terms + anti-diffusive exchange). Kept for comparison;
+    #       produces a negative combustible flux, diverging phase
+    #       temperatures, and no fundamental mode at moderate mu.
+    closure: str = "relaxational"
+
     # Moderator percolation: a dynamic, per-cell correlation length
     # driven by liquid-moderator melting/drainage/flash-off, replacing
     # the constant `mu` above wherever it's consumed (thermal.py,
@@ -72,7 +88,23 @@ class Config:
 
     # ICs
     T0:   float = 300.0   # Eq. (73)
-    P0:   float = 1.0     # Eq. (74)
+    # ── Power scale ────────────────────────────────────────────────
+    # The amplitude P is ABSOLUTE: phi = P * psi is the neutron flux in
+    # n/cm^2/s (psi's fuel phase normalised to unit integral), and the
+    # fission heating is converted to W/m^3 in thermal.py.
+    #
+    # P0 = None (default): the initial state is the SOURCE-DRIVEN steady
+    #   state of a subcritical drum, P0 = -q Lambda / rho0, with q the
+    #   Pu intrinsic neutron source. Requires k_eff(0) < 1.
+    # P0 = <number>: explicit initial amplitude (n/cm/s), overriding the
+    #   source-driven value (the source still acts during the transient).
+    P0:   float = None
+    # Intrinsic neutron source of the fuel phase: a preset ("reactor",
+    # "weapons") or a dict of Pu (and Am-241) mass fractions, see
+    # sources.py. source_density overrides it directly, in n/s/cm^3 of
+    # fuel phase; 0.0 switches the source off.
+    isotopics: object = "reactor"
+    source_density: float = None
 
     # Heating BC at z=0 (Eq. 61)
     T_f:        float = 1200.0
@@ -147,6 +179,12 @@ class Solver:
         self.phases = [make_PuO(), make_combustible()]
         self.v      = np.array([config.v1,
                                  1.0 - config.v1])
+        # intrinsic source, n/s/cm^3 of fuel phase
+        if config.source_density is not None:
+            self.q_density = float(config.source_density)
+        else:
+            rho_fuel_g_cc = self.phases[0].rho * 1.0e-3      # kg/m^3 -> g/cm^3
+            self.q_density = _pu_source_density(config.isotopics, rho_fuel_g_cc)
         self.history: List[dict] = []
 
     def _mu_field(self, theta: np.ndarray):
@@ -180,13 +218,21 @@ class Solver:
         theta = initialise_theta(cfg.percolation, mesh.N)
 
         k_eff, psi = static_shape_solve(
-            phases, mesh, T, v, self._mu_field(theta)
+            phases, mesh, T, v, self._mu_field(theta),
+            closure=cfg.closure
         )
-        Lambda = compute_Lambda(phases, mesh, psi, T)
-        P      = cfg.P0
+        Lambda = compute_Lambda(phases, mesh, psi, T, v)
+        rho    = (k_eff - 1.0) / k_eff
+        q0     = source_amplitude_rate(phases, mesh, psi, v, self.q_density)
+        if cfg.P0 is None:
+            if q0 <= 0.0:
+                raise ValueError("P0=None needs an intrinsic source; set "
+                                 "Config.P0 or a nonzero source.")
+            P = source_driven_steady_state(q0, rho, Lambda)
+        else:
+            P = cfg.P0
         C      = initialise_precursors(P, Lambda)
         phi    = P * psi
-        rho    = (k_eff - 1.0) / k_eff
 
         state = State(
             t=0.0, T=T, omega=omega,
@@ -205,10 +251,13 @@ class Solver:
         phases = self.phases
         mesh   = self.mesh
 
-        # A: Point kinetics
+        # A: Point kinetics, with the intrinsic source (constant over
+        # the step, evaluated on the step's starting shape)
+        q = source_amplitude_rate(phases, mesh, state.psi, state.v,
+                                  self.q_density)
         P_new, C_new = advance_kinetics(
             state.P, state.C,
-            state.rho, state.Lambda, dt
+            state.rho, state.Lambda, dt, q
         )
 
         # Percolation (evaluated at the step's STARTING theta/T2, same
@@ -236,11 +285,18 @@ class Solver:
         # B: Thermal solve. Uses mu computed from the OLD theta
         # (state.theta) -- consistent with T, omega, phi/psi all being
         # the step's starting values here too.
+        # Pyrolysis BEFORE conduction, exact over the step at the step's
+        # starting temperature, its heat released as exactly the energy
+        # of the volatiles consumed (thermal.pyrolysis_step). The thermal
+        # step's own explicit combustion term is switched off by passing
+        # zero omega, so the heat enters once, through S_extra.
+        omega_new, S_c = pyrolysis_step(phases, state.T, state.omega, dt)
+        S_extra = S_c if S_extra is None else S_extra + S_c
         mu_thermal = self._mu_field(state.theta)
         phi_new = P_new * state.psi
         T_new   = solve_thermal_step(
             phases, mesh,
-            state.T, state.omega,
+            state.T, np.zeros_like(state.omega),
             phi_new, state.v,
             mu_thermal, dt,
             cfg.T_f, cfg.h_conv, cfg.emissivity,
@@ -248,13 +304,11 @@ class Solver:
             T_amb=cfg.T_amb,
             h_conv_amb=cfg.h_conv_amb,
             emissivity_amb=cfg.emissivity_amb,
+            closure=cfg.closure,
             S_extra=S_extra,
         )
 
         # C: Pyrolysis
-        omega_new = advance_pyrolysis(
-            phases, T_new, state.omega, dt
-        )
 
         # D: Static shape solve (warm-started from the previous
         # timestep's converged shape/k_eff -- the fixed-point solve
@@ -271,10 +325,11 @@ class Solver:
         mu_shape = self._mu_field(theta_new)
         k_new, psi_new = static_shape_solve(
             phases, mesh, T_for_neutronics, state.v, mu_shape,
-            psi_init=state.psi, k_init=state.k_eff
+            psi_init=state.psi, k_init=state.k_eff,
+            closure=cfg.closure
         )
         Lambda_new = compute_Lambda(
-            phases, mesh, psi_new, T_for_neutronics
+            phases, mesh, psi_new, T_for_neutronics, state.v
         )
         rho_new = (k_new - 1.0) / k_new
 

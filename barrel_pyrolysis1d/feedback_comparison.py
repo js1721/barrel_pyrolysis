@@ -50,8 +50,16 @@ def _save(fig, name):
 
 def main():
     base = dict(
-        H=40.0, N=80, mu=0.15, v1=0.5757877395611601,
-        t_end=300.0, dt=0.05, T0=300.0, P0=1.0,
+        # mu and v1 (relaxational closure, joint eigenvalue, Marshak BC):
+        # criticality by composition exists only for mu > ~0.071 cm^-1.
+        # Below that the fuel chords exceed ~14 cm, a single fuel chunk is
+        # supercritical on its own, and k > 1 for every composition. v1 is
+        # bisected for k_eff(0) = 0.98 at the chosen mu (source-driven start).
+        # "Low mu" here means mu = 0.2: ~3x the minimum mu that admits a
+        # critical composition at all.
+        # subcritical storage state, k_eff(0) = 0.98 (a choice -- change v1 to change it); the initial power follows from the reactor-grade Pu intrinsic source, see Config.P0 / sources.py
+        H=40.0, N=80, mu=0.2, v1=0.21656336431265344,
+        t_end=300.0, dt=0.05, T0=300.0,
         T_f=1200.0, h_conv=50.0, emissivity=0.3, T_amb=300.0,
         Ef=3.2e-11,
     )
@@ -92,14 +100,19 @@ def main():
     psi_on  = solver_on.last_state.psi
     psi_off = solver_off.last_state.psi
 
-    fig, ax = plt.subplots()
-    ax.plot(z, psi_on[0],  color=BLUE,   ls="-",  label=r"$\psi_1$ PuO, with feedback")
-    ax.plot(z, psi_on[1],  color=ORANGE, ls="-",  label=r"$\psi_2$ Combustible, with feedback")
-    ax.plot(z, psi_off[0], color=BLUE,   ls="--", label=r"$\psi_1$ PuO, without feedback")
-    ax.plot(z, psi_off[1], color=ORANGE, ls="--", label=r"$\psi_2$ Combustible, without feedback")
-    ax.set(xlabel="$z$ (cm)", ylabel=r"$\psi(z)$",
-           title=f"Flux shape at t={solver_on.last_state.t:.0f}s")
-    ax.legend(fontsize=9)
+    # psi has shape (phase, group, N) since the two-group model: one
+    # panel per energy group (0 = fast, 1 = thermal), matching
+    # publication_plots.py.
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharex=True)
+    for g, (ax, gname) in enumerate(zip(axes, ["fast", "thermal"])):
+        ax.plot(z, psi_on[0, g],  color=BLUE,   ls="-",  label=r"$\psi_1$ PuO, with feedback")
+        ax.plot(z, psi_on[1, g],  color=ORANGE, ls="-",  label=r"$\psi_2$ Combustible, with feedback")
+        ax.plot(z, psi_off[0, g], color=BLUE,   ls="--", label=r"$\psi_1$ PuO, without feedback")
+        ax.plot(z, psi_off[1, g], color=ORANGE, ls="--", label=r"$\psi_2$ Combustible, without feedback")
+        ax.set(xlabel="$z$ (cm)", ylabel=r"$\psi(z)$",
+               title=f"{gname} group, t={solver_on.last_state.t:.0f}s")
+    axes[0].legend(fontsize=8)
+    fig.tight_layout()
     _save(fig, "fig_feedback_compare_flux")
 
     print(f"\nWith feedback:    k_eff(0)={k_on[0]:.6f}  k_eff(end)={k_on[-1]:.6f}  "

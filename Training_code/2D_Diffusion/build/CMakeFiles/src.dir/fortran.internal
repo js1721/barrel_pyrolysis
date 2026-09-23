@@ -1,0 +1,19 @@
+# The fortran modules provided by this target.
+provides
+ mod_bc.mod
+ mod_constants.mod
+ mod_diffusion_matrix.mod
+ mod_eigenvalue.mod
+ mod_geometry.mod
+ mod_map.mod
+ mod_materials.mod
+ mod_materials_data.mod
+ mod_mg.mod
+ mod_output.mod
+ mod_params.mod
+ mod_postprocess.mod
+ mod_solver.mod
+ mod_solver_pcg.mod
+ mod_source.mod
+ mod_sprs.mod
+ mod_types.mod

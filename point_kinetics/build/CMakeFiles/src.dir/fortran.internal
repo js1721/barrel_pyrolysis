@@ -1,0 +1,6 @@
+# The fortran modules provided by this target.
+provides
+ mod_cvode_wrapper.mod
+ mod_mesh.mod
+ mod_pk.mod
+ mod_pk_solver.mod

@@ -46,33 +46,50 @@ def advance_kinetics(P: float,
                       C: np.ndarray,
                       rho: float,
                       Lambda: float,
-                      dt: float) -> tuple:
+                      dt: float,
+                      q: float = 0.0) -> tuple:
     """
-    Advance point kinetics by dt using matrix exponential.
+    Advance point kinetics by dt, EXACTLY, including an external source:
 
-    Exact solution of the linear ODE system.
+        dP/dt   = (rho - beta)/Lambda P + sum_j lambda_j C_j + q
+        dC_j/dt = beta_j/Lambda P - lambda_j C_j
 
-    Parameters
-    ----------
-    P      : current amplitude
-    C      : precursor concentrations shape (I,)
-    rho    : current reactivity
-    Lambda : current prompt neutron lifetime s
-    dt     : timestep s
-
-    Returns
-    -------
-    P_new : float
-    C_new : np.ndarray shape (I,)
+    q is the source in amplitude units per second (see
+    neutronics.source_amplitude_rate), held constant over the step. The
+    inhomogeneous system is solved with one matrix exponential of the
+    augmented matrix [[A, b], [0, 0]], b = (q, 0, ..., 0), so the source
+    is integrated exactly rather than by a quadrature. q = 0 reproduces
+    the previous source-free update.
     """
-    A         = build_pk_matrix(rho, Lambda)
-    state     = np.concatenate([[P], C])
-    state_new = expm(A * dt) @ state
-
+    A = build_pk_matrix(rho, Lambda)
+    n = A.shape[0]
+    Aug = np.zeros((n + 1, n + 1))
+    Aug[:n, :n] = A
+    Aug[0, n] = q
+    state = np.concatenate([[P], C, [1.0]])
+    state_new = expm(Aug * dt) @ state
     P_new = max(float(state_new[0]), 0.0)
-    C_new = np.maximum(state_new[1:], 0.0)
-
+    C_new = np.maximum(state_new[1:n], 0.0)
     return P_new, C_new
+
+
+def source_driven_steady_state(q: float, rho: float, Lambda: float) -> float:
+    """
+    Steady amplitude of a SUBCRITICAL system driven by source q:
+    setting dP/dt = dC/dt = 0 gives sum_j lambda_j C_j = beta P/Lambda,
+    hence 0 = rho P/Lambda + q, i.e.
+
+        P_0 = -q Lambda / rho        (rho < 0).
+
+    No steady state exists at or above critical: with a source, a
+    critical system's power grows linearly and a supercritical one's
+    exponentially.
+    """
+    if rho >= 0.0:
+        raise ValueError(
+            f"no source-driven steady state at rho = {rho:.4g} >= 0; start "
+            f"from a subcritical composition, or set Config.P0 explicitly.")
+    return -q * Lambda / rho
 
 
 def initialise_precursors(P0: float,

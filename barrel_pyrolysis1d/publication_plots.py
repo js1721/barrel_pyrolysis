@@ -58,9 +58,9 @@ def _save(fig, name):
 
 def main():
     cfg = Config(
-        H=40.0, N=80, mu=0.0291785563199653, v1=0.7,   # critical run -- see main.py
+        H=40.0, N=80, mu=0.5, v1=0.17068927633801423,   # k0 = 0.98, source-driven -- see main.py
         t_end=300.0, dt=0.05,
-        T0=300.0, P0=1.0,
+        T0=300.0,
         T_f=1200.0, h_conv=50.0, emissivity=0.3, T_amb=300.0,
         Ef=3.2e-11,
     )

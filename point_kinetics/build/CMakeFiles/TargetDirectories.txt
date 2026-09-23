@@ -1,0 +1,4 @@
+/Users/joe/Desktop/Postgraduate/ICL_Kinetics/Joe/point_kinetics/build/CMakeFiles/src.dir
+/Users/joe/Desktop/Postgraduate/ICL_Kinetics/Joe/point_kinetics/build/CMakeFiles/out.dir
+/Users/joe/Desktop/Postgraduate/ICL_Kinetics/Joe/point_kinetics/build/CMakeFiles/edit_cache.dir
+/Users/joe/Desktop/Postgraduate/ICL_Kinetics/Joe/point_kinetics/build/CMakeFiles/rebuild_cache.dir
